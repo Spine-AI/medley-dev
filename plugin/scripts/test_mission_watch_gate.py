@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# Tests mission-watch-gate.py — the Codex Stop-hook supervision channel.
+# Tests mission-watch-gate.py — the Codex Stop-hook supervision BACKSTOP.
 #
-# The risk this file guards is asymmetric. A missed digest is a minor annoyance; a WRONGLY BLOCKED
-# turn traps the user's agent in a loop they cannot escape. So almost every case below asserts that
-# the hook stays OUT OF THE WAY, and only two assert that it blocks.
+# The gate no longer delivers digests (mission_wait does, and returns buffered lines immediately). Its
+# one job is to notice that the supervising session stopped while its mission is still live, and push
+# the agent back into the mission_wait loop. So it needs no engine, no daemon, no database and no
+# network — only the two on-disk facts: is a mission live, and does THIS session supervise it.
 #
-# A fake engine stands in for the real binary via a stubbed resolve-engine.sh, so no daemon, no
-# database and no network are involved.
+# The risk this file guards is asymmetric. A missed nudge just means the agent stopped supervising; a
+# WRONGLY BLOCKED turn traps the user's agent in a loop they cannot escape. So almost every case below
+# asserts that the hook stays OUT OF THE WAY.
 # Run: python3 plugin/scripts/test_mission_watch_gate.py
 import json
 import os
@@ -18,8 +20,6 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GATE = os.path.join(HERE, "mission-watch-gate.py")
-
-DIGEST = "✓ build-api finished\n⚡ needs you: approve rm -rf build/"
 
 
 class WatchGateCase(unittest.TestCase):
@@ -53,29 +53,6 @@ class WatchGateCase(unittest.TestCase):
         with open(os.path.join(d, session_id + ".json"), "w") as fh:
             json.dump({"missions": missions, "updatedAt": 1}, fh)
 
-    def stub_engine(self, stdout="", exit_code=0):
-        """Install a fake engine + a resolve-engine.sh pointing at it. A quoted heredoc keeps the
-        digest text (emoji, quotes, newlines) intact without shell-escaping games."""
-        engine = os.path.join(self.bin, "fake-engine")
-        with open(engine, "w") as fh:
-            fh.write(
-                "#!/usr/bin/env bash\ncat <<'MEDLEY_EOF'\n%s\nMEDLEY_EOF\nexit %d\n"
-                % (stdout, exit_code)
-            )
-        os.chmod(engine, 0o755)
-        resolver = os.path.join(self.bin, "resolve-engine.sh")
-        with open(resolver, "w") as fh:
-            fh.write("#!/usr/bin/env bash\necho %s\n" % engine)
-        os.chmod(resolver, 0o755)
-        return engine
-
-    def no_engine(self):
-        """resolve-engine.sh that finds nothing (exit 1, no output) — the fresh-install case."""
-        resolver = os.path.join(self.bin, "resolve-engine.sh")
-        with open(resolver, "w") as fh:
-            fh.write("#!/usr/bin/env bash\nexit 1\n")
-        os.chmod(resolver, 0o755)
-
     # --- driver ---------------------------------------------------------------------------
     def run_hook(self, stop_hook_active=False, session_id="s1", host="codex", env_extra=None,
                  event="Stop"):
@@ -96,7 +73,6 @@ class WatchGateCase(unittest.TestCase):
         elif host == "codex-datadir":
             env["CLAUDE_PLUGIN_DATA"] = "/x/.codex/plugins/data/medley-medley-dev"
         # host == "claude" → neither signal set
-        env["MEDLEY_STOP_WATCH_TIMEOUT"] = "2"  # keep the suite fast
         if env_extra:
             env.update(env_extra)
         proc = subprocess.run([sys.executable, self.gate], input=json.dumps(payload),
@@ -120,24 +96,29 @@ class TestBlocksWhenItShould(WatchGateCase):
         self.write_state()
         self.write_binding("s1", ["m1"])
 
-    def test_blocks_with_the_digest(self):
-        self.stub_engine(stdout=DIGEST)
+    def test_blocks_when_the_supervisor_stops_mid_mission(self):
         code, decision, reason = self.run_hook()
         self.assertEqual(code, 0)
         self.assertEqual(decision, "block")
-        self.assertIn("build-api finished", reason)
-        self.assertIn("Ship the widget", reason)
+        self.assertIn("Ship the widget", reason)  # names the mission it's about
 
-    def test_reason_steers_the_agent_correctly(self):
-        self.stub_engine(stdout=DIGEST)
+    def test_reason_pushes_the_agent_back_into_the_loop(self):
         _, _, reason = self.run_hook()
-        # Must tell it to relay + not to background a watcher on this host.
-        self.assertIn("relay", reason.lower())
+        # The nudge must name the tool to resume, forbid the watcher this host can't collect,
+        # and offer the legitimate way to actually stop.
+        self.assertIn("mission_wait", reason)
         self.assertIn("background", reason.lower())
         self.assertIn("mission_status", reason)
+        self.assertIn("mission_pause", reason)
+
+    def test_needs_no_engine(self):
+        """The backstop reads only on-disk state — no resolve-engine.sh, no binary, no daemon. A
+        fresh install with no engine downloaded yet must still get the nudge."""
+        self.assertFalse(os.path.exists(os.path.join(self.bin, "resolve-engine.sh")))
+        _, decision, _ = self.run_hook()
+        self.assertEqual(decision, "block")
 
     def test_wildcard_binding_supervises(self):
-        self.stub_engine(stdout=DIGEST)
         self.write_binding("s1", ["*"])
         _, decision, _ = self.run_hook()
         self.assertEqual(decision, "block")
@@ -150,7 +131,6 @@ class TestStaysOutOfTheWay(WatchGateCase):
         super().setUp()
         self.write_state()
         self.write_binding("s1", ["m1"])
-        self.stub_engine(stdout=DIGEST)
 
     def test_worker_never_supervises(self):
         self.assertPassesThrough(env_extra={"MEDLEY_WORKER": "1"})
@@ -170,19 +150,6 @@ class TestStaysOutOfTheWay(WatchGateCase):
 
     def test_path_unsafe_session_id_refused(self):
         self.assertPassesThrough(session_id="../escape")
-
-    def test_no_engine_yet(self):
-        self.no_engine()
-        self.assertPassesThrough()
-
-    def test_watch_silent_means_nothing_happened(self):
-        self.stub_engine(stdout="")
-        self.assertPassesThrough()
-
-    def test_heartbeat_only_output_does_not_block(self):
-        # A watch timeout with no activity must not trap the agent on an empty digest.
-        self.stub_engine(stdout="no activity in the last 900s")
-        self.assertPassesThrough()
 
     def test_paused_mission_is_not_live(self):
         self.write_state(status="paused")

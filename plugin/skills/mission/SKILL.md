@@ -266,20 +266,15 @@ before start **replaces** the plan. **Never call mission_start without their exp
 streams every worker's feed and lets them resolve approvals and steer workers directly.
 Then:
 
-1. **Arm the watcher** exactly as the tool response instructs: run the `watch` command as
-   a **background Bash task** (`run_in_background: true`). It exits when something
-   noteworthy happens (task done/failed, ⚡ needs-you, 🔍 review activity/⚡ verdicts) and
-   its completion wakes you.
-2. **End your turn** with a short kickoff summary (what's running, what's queued). The
-   conversation stays fully usable — but the repo does not (lockdown, below).
-3. **When the watcher completes**: relay its digest in one or two lines, act on anything
-   that needs you (below, or the review loop in §5), then **re-arm the watcher** — until
-   the engine finalizes the mission.
-   If a watcher notification arrives while you're mid-something-else, a one-line relay is
-   enough; don't derail the user's current thread.
-4. On demand: `mission_status` (brief table), `task_logs` (one task's output — pull only
-   what you need, `summary` first), `mission_wait` (inline long-poll when the user says
-   "wait for it").
+1. **Supervise exactly as `mission_start`'s response instructs.** The channel is
+   host-specific — the two hosts wake an agent in opposite ways, and the engine knows which
+   one you're on, so its instruction is authoritative. Never mix channels or invent a third.
+   Full rationale, if you need it: `hosts/<claude-code|codex>.md`.
+2. **Each time activity reaches you**: relay it in one or two lines, act on anything that
+   needs you (below, or the review loop in §5), then go back to watching — until the engine
+   finalizes the mission. Mid-thread, a one-line relay is enough; don't derail the user.
+3. On demand: `mission_status` (brief table), `task_logs` (one task's output — pull only what
+   you need, `summary` first).
 
 **Mission banner** — while a mission is active, lead **every reply** (whatever the topic)
 with a one-line banner: `MEDLEY · <title> · RUNNING · 4/9` — status from the latest
@@ -426,7 +421,8 @@ pending?" recovery hatch at any time.
   them free.
 - Never review a batch yourself — no diff-reading, no test-running, no verdicts. The
   engine's reviewer owns that; your job is relaying and resolving attention.
-- Don't poll in a loop — the watcher wakes you. One watcher at a time.
+- Don't poll `mission_status` in a loop, and keep one watch channel in flight at a time
+  (`hosts/<host>.md`).
 - Be honest about failures and limits (rate limits surface as paused workers; they
   auto-resume when the window resets).
 

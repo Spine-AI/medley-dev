@@ -195,12 +195,14 @@ All engine-repo work. `routing.prefer` is global config today
 (`engine/models/routing.ts:118`, ordered `kimi-oss → claude-code → codex`) and one `~/.medley`
 serves both hosts, so the host has to travel on the wire.
 
-- [ ] `--host <id>` flag on the engine `mcp` command and `plugin/scripts/run-engine.sh`
-- [ ] `mcpProxyHeaders()` emits `X-Medley-Host` (beside the existing `X-Medley-Caller`) —
-      `engine/headless/medley-engine.ts:718`
-- [ ] `/mcp` handler reads `x-medley-host` onto the session —
-      `engine/services/dashboard-server.ts:913-980`
-- [ ] `missions` table gains a **nullable** `host` column + migration
+- [x] `--host <id>` flag on the engine `mcp` command (`parseMcpProxyHost`; `medley-mcp.sh` already
+      forwards `"$@"`, so the Codex manifest's `mcp --host codex` now lands instead of being ignored)
+- [x] `mcpProxyHeaders()` emits `X-Medley-Host` — omitted entirely when no `--host` was passed, so
+      Claude Code and every older plugin stay on the no-header (= `claude-code`) path
+- [x] `/mcp` handler reads `x-medley-host` onto the session (`decodeHostHeader`, in
+      `models/runtime.ts` beside the type — pure, and cheap to import in a test)
+- [ ] `missions` table gains a **nullable** `host` column + migration *(only needed for ROUTING —
+      supervision reads the session's host directly, so this is still open for Phase 2 proper)*
 - [ ] `HOST_NATIVE_PREFER` in `engine/models/routing.ts`:
       `codex: ['codex','kimi-oss','claude-code']`
 - [ ] `routeRuntime()` consults it **only when the user has not set `prefer`**
@@ -247,6 +249,23 @@ machine is unchanged.
 
 ## Phase 4 — gaps and accepted losses
 
+- [x] **Supervision — SOLVED, and not the way this file assumed.** Codex has no wake-on-exit, so the
+      first cut used a `Stop` hook to hold the turn open ~25s per turn-end and hand back a digest: one
+      peek per user turn, and the mission went dark in between. Measured on 0.145: Codex accepts input
+      into a RUNNING turn (`turn/steer`, `steer_count` turn telemetry, `ActiveTurnNotSteerable`), which
+      is the constraint Claude Code's background watcher exists to work around and which Codex does
+      not have. So the agent now **loops `mission_wait` inside one long turn**, and the `Stop` hook is
+      demoted to a backstop that pushes it back in if it leaves early.
+      Being parked in a tool call is also what makes two engine push channels legal:
+      `notifications/progress` (host-rendered live activity, zero model tokens) and
+      `elicitation/create` for ⚡ items — Codex gates the latter behind `tool_call_mcp_elicitation`
+      (stable/**true**), i.e. an elicitation is expected to belong to an in-flight tool call, which the
+      loop satisfies by construction. Answered on the way: a Codex **subagent** is the wrong
+      mechanism (`wait_agent` blocks the parent, so it buys the same held turn while paying a second
+      model; `multi_agent_v2`'s mailbox and `request_user_input` are both OFF by default).
+      Shipped: `--host` → `X-Medley-Host` → session host → host-shaped `mission_start`/`mission_wait`
+      text, `engine/services/supervision-channel.ts`, `mission_supervision_armed` +
+      `attention_elicited` telemetry, `plugin/skills/mission/hosts/*.md`.
 - [ ] **Statusline — accepted loss, write it down.** Codex 0.145 has no user-supplied statusline
       (`status_line` is a TUI display pref, not a command hook). The mission deep link, the
       `⟳ downloading engine` indicator and live task counters have no Codex equivalent.
