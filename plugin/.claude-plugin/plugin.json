@@ -1,11 +1,23 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "medley",
-  "version": "0.8.6-dev.0",
-  "description": "[DEV CHANNEL] Missions inside Claude Code: give /mission a goal and Medley plans the work, then supervises execution until the goal is met — bringing you in for the higher-level decisions and reviews that actually need you, not routine approvals. Work is distributed across models: Claude by default, extending to GPT, open-source, and others you configure when that buys performance or token efficiency. Steer any time from Claude Code or a live dashboard, and everything stays on your machine — nothing leaves your local environment except model calls and optional debug info.",
-  "author": { "name": "Spine", "email": "engineering@getspine.ai" },
+  "version": "0.8.6-dev.2",
+  "description": "[DEV CHANNEL] Missions inside Claude Code: give /mission a goal and Medley plans the work, then supervises execution until the goal is met \u2014 bringing you in for the higher-level decisions and reviews that actually need you, not routine approvals. Work is distributed across models: Claude by default, extending to GPT, open-source, and others you configure when that buys performance or token efficiency. Steer any time from Claude Code or a live dashboard, and everything stays on your machine \u2014 nothing leaves your local environment except model calls and optional debug info.",
+  "author": {
+    "name": "Spine",
+    "email": "engineering@getspine.ai"
+  },
   "homepage": "https://github.com/Spine-AI/medley-dev",
   "repository": "https://github.com/Spine-AI/medley-dev",
   "license": "MIT",
-  "keywords": ["missions", "orchestration", "agents", "task-dag", "parallel-workers", "mcp", "codex", "cursor"]
+  "keywords": [
+    "missions",
+    "orchestration",
+    "agents",
+    "task-dag",
+    "parallel-workers",
+    "mcp",
+    "codex",
+    "cursor"
+  ]
 }

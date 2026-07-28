@@ -16,7 +16,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Task|Bash",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Task|Bash|apply_patch|spawn_agent",
         "hooks": [
           { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/edit-conflict-gate.py\"" }
         ]
@@ -27,6 +27,13 @@
         "matcher": "mcp__.*__mission_(start|resume|status|wait)",
         "hooks": [
           { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-mission-binder.py\"" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "timeout": 40, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/mission-watch-gate.py\"" }
         ]
       }
     ]

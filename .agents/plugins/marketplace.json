@@ -1,0 +1,20 @@
+{
+  "name": "medley-dev",
+  "interface": {
+    "displayName": "Medley dev channel"
+  },
+  "plugins": [
+    {
+      "name": "medley",
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Development"
+    }
+  ]
+}

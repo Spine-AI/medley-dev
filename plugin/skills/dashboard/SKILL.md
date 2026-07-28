@@ -5,10 +5,13 @@ description: Open the Medley web dashboard — one shared UI listing every repo'
 
 # /dashboard — surface the Medley web UI
 
-Call the `dashboard_url` tool on the `medley` MCP server (if it isn't loaded yet:
-ToolSearch `"select:mcp__plugin_medley_medley__dashboard_url"`, then call it) and give the
-user **exactly the URL it returns** — e.g. "Medley dashboard: http://127.0.0.1:8730/?mission=… — the
-settings button (top right) has providers, routing tiers, and approval defaults."
+Call the `dashboard_url` tool on the `medley` MCP server and give the user **exactly the URL it
+returns** — e.g. "Medley dashboard: http://127.0.0.1:8730/?mission=… — the settings button (top
+right) has providers, routing tiers, and approval defaults."
+
+If the tool isn't loaded yet, load it by its **host-specific name**: Claude Code namespaces plugin
+MCP tools as `mcp__plugin_medley_medley__dashboard_url`, Codex as `mcp__medley__dashboard_url`. On a
+host with ToolSearch, probe the one matching your host (or both — the miss is harmless).
 
 **Relay the tool's URL verbatim — never assume `localhost` or port `8730`.** The daemon advertises the
 `127.0.0.1` literal (a bare `localhost` URL hangs on macOS, which resolves it to IPv6 `::1` where the

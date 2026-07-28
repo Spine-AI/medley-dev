@@ -282,6 +282,135 @@ class TestLockdownDenials(GateTestCase):
             self.assertIn("Ship the widget", reason)
 
 
+class TestCodexToolNames(GateTestCase):
+    """Codex 0.145 host coverage. Payload shapes here are VERBATIM from the A0 probe (a real
+    `codex exec` run with the gate tapped), not invented:
+
+      shell       -> tool_name "Bash",        tool_input {"command": "echo A0-PROBE-SHELL"}
+      file edit   -> tool_name "apply_patch", tool_input {"command": "*** Begin Patch\\n..."}
+
+    The load-bearing discovery is that Codex ALIASES its shell tool to Claude's name, so the whole
+    Bash allowlist already applied on Codex before this change — only apply_patch slipped through.
+    """
+
+    # Exactly what Codex sent for "rewrite probe.txt to 'line two'".
+    REWRITE = (
+        "*** Begin Patch\n"
+        "*** Delete File: probe.txt\n"
+        "*** Add File: probe.txt\n"
+        "+line two\n"
+        "*** End Patch"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.write_state(lockdown=True)
+        self.write_session_binding("test-session", ["m1"])
+
+    def deny_reason(self, tool, tool_input):
+        code, decision, reason = run_gate_full(
+            self.payload(tool, tool_input), tmpdir=self.repo
+        )
+        self.assertEqual(decision, "deny", "expected a deny for %s" % tool)
+        return reason
+
+    # --- the shell alias (regression guard: this already worked, keep it working) ------------
+    def test_codex_shell_arrives_as_bash_and_is_allowlisted(self):
+        code, decision = self.gate("Bash", {"command": "echo A0-PROBE-SHELL"})
+        self.assertEqual((code, decision), (0, None))
+
+    def test_codex_mutating_shell_denied(self):
+        reason = self.deny_reason("Bash", {"command": "rm -rf src"})
+        self.assertIn("mission_pause", reason)
+
+    # --- apply_patch: the actual gap this change closes -------------------------------------
+    def test_apply_patch_in_repo_denied(self):
+        reason = self.deny_reason("apply_patch", {"command": self.REWRITE})
+        self.assertIn("Ship the widget", reason)
+        self.assertIn("mission_pause", reason)
+
+    def test_apply_patch_update_verb_denied(self):
+        env = "*** Begin Patch\n*** Update File: src/a.py\n@@\n-old\n+new\n*** End Patch"
+        self.assertIn("mission_pause", self.deny_reason("apply_patch", {"command": env}))
+
+    def test_apply_patch_delete_verb_denied(self):
+        env = "*** Begin Patch\n*** Delete File: src/gone.py\n*** End Patch"
+        self.assertIn("mission_pause", self.deny_reason("apply_patch", {"command": env}))
+
+    def test_apply_patch_move_target_denied(self):
+        # A rename whose Move-to lands in the repo must not slip past.
+        env = "*** Begin Patch\n*** Update File: src/a.py\n*** Move to: src/b.py\n*** End Patch"
+        self.assertIn("mission_pause", self.deny_reason("apply_patch", {"command": env}))
+
+    def test_apply_patch_wholly_outside_repo_allowed(self):
+        with tempfile.TemporaryDirectory() as outside:
+            env = "*** Begin Patch\n*** Add File: %s\n+note\n*** End Patch" % os.path.join(
+                outside, "scratch.md"
+            )
+            code, decision = self.gate("apply_patch", {"command": env})
+            self.assertEqual((code, decision), (0, None))
+
+    def test_apply_patch_mixed_paths_denied(self):
+        # One in-repo path is enough: a patch applies atomically, so there is no partial allow.
+        with tempfile.TemporaryDirectory() as outside:
+            env = (
+                "*** Begin Patch\n"
+                "*** Add File: %s\n+note\n"
+                "*** Update File: src/a.py\n@@\n-old\n+new\n"
+                "*** End Patch" % os.path.join(outside, "scratch.md")
+            )
+            self.assertIn("mission_pause", self.deny_reason("apply_patch", {"command": env}))
+
+    def test_unparseable_envelope_denied(self):
+        # Parse anomaly → assume it writes the repo, mirroring the Bash branch's posture.
+        self.assertIn("mission_pause", self.deny_reason("apply_patch", {"command": "garbage"}))
+        self.assertIn("mission_pause", self.deny_reason("apply_patch", {}))
+
+    def test_codex_spawn_tool_denied(self):
+        reason = self.deny_reason("spawn_agent", {"prompt": "go implement it"})
+        self.assertIn("execution", reason)
+        self.assertIn("mission_pause", reason)
+
+    # --- fail-open is preserved for anything we do not recognise ----------------------------
+    def test_unknown_codex_tool_still_fails_open(self):
+        for tool in ("update_plan", "view_image", "unified_exec", "wait_agent"):
+            code, decision = self.gate(tool, {"command": "rm -rf /"})
+            self.assertEqual((code, decision), (0, None), "%s should fail open" % tool)
+
+
+class TestCodexPerFileConflictWarning(GateTestCase):
+    """apply_patch must also reach the NON-lockdown per-file warn-once path, so a Codex session
+    that is not the supervisor still gets told it is about to clobber a live worker's file."""
+
+    REWRITE = "*** Begin Patch\n*** Update File: src/a.py\n@@\n-old\n+new\n*** End Patch"
+
+    def setUp(self):
+        super().setUp()
+        # No mission-state.json at all → straight to the fallthrough gate.
+        with open(os.path.join(self.repo, ".medley", "active-work.json"), "w") as f:
+            json.dump(
+                {"tasks": [{"taskId": "t1", "title": "Build API", "mission": "M",
+                            "files": ["src/a.py"]}]},
+                f,
+            )
+
+    def test_apply_patch_warns_once_then_passes(self):
+        code, decision, reason = run_gate_full(
+            self.payload("apply_patch", {"command": self.REWRITE}), tmpdir=self.repo
+        )
+        self.assertEqual(decision, "deny")
+        self.assertIn("Build API", reason)
+        self.assertIn("src/a.py", reason)
+        # Retry: warn-once means the same call now goes through.
+        code, decision = self.gate("apply_patch", {"command": self.REWRITE})
+        self.assertEqual((code, decision), (0, None))
+
+    def test_apply_patch_on_unclaimed_file_passes(self):
+        env = "*** Begin Patch\n*** Update File: src/untouched.py\n@@\n-a\n+b\n*** End Patch"
+        code, decision = self.gate("apply_patch", {"command": env})
+        self.assertEqual((code, decision), (0, None))
+
+
 class TestEngineBinaryCarveOut(GateTestCase):
     """The daemon declares its own binary in mission-state.json (engine.execPath/.entry);
     the gate realpath-verifies it and passes its read-only verbs — mission_start's own watch

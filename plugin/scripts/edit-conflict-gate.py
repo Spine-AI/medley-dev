@@ -34,8 +34,19 @@ if payload.get("hook_event_name") != "PreToolUse":
     sys.exit(0)
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# Codex's file-edit tool. MEASURED against Codex 0.145 (see A0 probe): its shell tool arrives here
+# ALIASED to Claude's name — tool_name "Bash", command in tool_input["command"] — so the Bash branch
+# below already works unchanged on both hosts. `apply_patch` is the one that does NOT alias: it keeps
+# its own name and puts a whole patch ENVELOPE in tool_input["command"] (not "input", and not a
+# file_path), so it needs its own path extraction.
+PATCH_TOOLS = ("apply_patch",)
+# Sub-agent spawn. "Task" is Claude Code's. Codex's multi-agent tools are spawn_agent / send_input /
+# resume_agent / wait_agent / close_agent; which name reaches a hook is NOT yet measured (no spawn
+# occurred under `codex exec`, and multi-agent needs the TUI). Listing spawn_agent costs nothing and
+# is a no-op if Codex turns out to alias it to Task the way it aliases shell to Bash.
+SPAWN_TOOLS = ("Task", "spawn_agent")
 tool_name = payload.get("tool_name")
-if tool_name not in EDIT_TOOLS + ("Task", "Bash"):
+if tool_name not in EDIT_TOOLS + PATCH_TOOLS + SPAWN_TOOLS + ("Bash",):
     sys.exit(0)
 
 tool_input = payload.get("tool_input") or {}
@@ -126,6 +137,35 @@ PUNCT_CHARS = set("();<>|&")
 # `./build=release.sh` is a COMMAND. (env is looser: it assigns on any '=', so the env
 # branch keeps its bare `"=" in token` test.)
 SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+# --- apply_patch envelope parsing -----------------------------------------
+# Codex hands the gate the raw patch text. Measured shape (a rewrite of one file):
+#   *** Begin Patch
+#   *** Delete File: probe.txt
+#   *** Add File: probe.txt
+#   +line two
+#   *** End Patch
+# Every operation names its file on a `*** <Verb> File:` line; a rename adds `*** Move to:`. Paths
+# are relative to the tool's cwd. We only need the SET of touched paths, never the diff body.
+PATCH_FILE_LINE = re.compile(r"^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+?)\s*$", re.MULTILINE)
+PATCH_MOVE_LINE = re.compile(r"^\*\*\*\s+Move\s+to:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def patch_paths(cmd):
+    """Every path an apply_patch envelope touches. Empty list when nothing parses — callers treat
+    that as 'unknown, assume it writes the repo' rather than 'writes nothing', matching the Bash
+    branch's parse-anomaly posture."""
+    if not isinstance(cmd, str) or not cmd:
+        return []
+    return PATCH_FILE_LINE.findall(cmd) + PATCH_MOVE_LINE.findall(cmd)
+
+
+def in_repo(rel_or_abs: str) -> bool:
+    """True iff a path from a patch envelope resolves inside the project root."""
+    root = os.path.realpath(project)
+    target = os.path.realpath(os.path.join(project, rel_or_abs))
+    return target == root or target.startswith(root + os.sep)
 
 
 def _same_file(a: str, b: str) -> bool:
@@ -332,11 +372,11 @@ def lockdown_deny_reason(state, missions):
     """Today's lockdown rules, verbatim: the deny reason for this tool call under a live
     mission, or None when the call is allowed (read-only / outside the repo)."""
     phrase = mission_phrase(missions)
-    if tool_name == "Task":
+    if tool_name in SPAWN_TOOLS:
         return (
             f"STOP: {phrase} — workers are the execution "
             "layer; the host session must not spawn subagents for mission work. Use "
-            "task_steer to redirect a worker or mission_plan_submit to add tasks; "
+            "task_steer to redirect a worker or mission_steer to add tasks; "
             "mission_pause reclaims the repo for direct work."
         )
     if tool_name in EDIT_TOOLS:
@@ -349,10 +389,25 @@ def lockdown_deny_reason(state, missions):
             return (
                 f"STOP: {phrase} — the repo is read-only "
                 "for the host session while workers execute. Use task_steer to "
-                "redirect a worker, mission_plan_submit to add tasks, or "
+                "redirect a worker, mission_steer to add tasks, or "
                 "mission_pause to reclaim the repo; mission_stop cancels the mission."
             )
         return None  # outside the repo (scratchpads, ~/.claude plans) → allow
+    if tool_name in PATCH_TOOLS:
+        # A supervising session must not write the workers' tree at all, so ANY in-repo path in the
+        # envelope denies the whole call — a patch is atomic, there is no partial-apply to allow.
+        # An envelope we cannot parse also denies: same reasoning as the Bash branch, where a parse
+        # anomaly is treated as "could mutate". A patch that touches only paths outside the repo
+        # (a scratchpad note) still passes.
+        paths = patch_paths(tool_input.get("command"))
+        if paths and not any(in_repo(p) for p in paths):
+            return None
+        return (
+            f"STOP: {phrase} — the repo is read-only "
+            "for the host session while workers execute. Use task_steer to "
+            "redirect a worker, mission_steer to add tasks, or "
+            "mission_pause to reclaim the repo; mission_stop cancels the mission."
+        )
     if tool_name == "Bash":
         cmd = tool_input.get("command") or ""
         if command_is_readonly(cmd, state.get("engine")):
@@ -407,11 +462,17 @@ if state is not None:
 # Fallthrough: original per-file warn-once gate (edit tools only)
 # ---------------------------------------------------------------------------
 
-if tool_name not in EDIT_TOOLS:
+if tool_name not in EDIT_TOOLS + PATCH_TOOLS:
     sys.exit(0)
 
-file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-if not file_path:
+# One list either way: Claude's edit tools name a single file; a Codex apply_patch envelope can
+# touch several, and overlapping ANY of them with a live worker's file is worth the same warning.
+if tool_name in PATCH_TOOLS:
+    edit_paths = patch_paths(tool_input.get("command"))
+else:
+    single = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    edit_paths = [single] if single else []
+if not edit_paths:
     sys.exit(0)
 
 work_file = os.path.join(project, ".medley", "active-work.json")
@@ -431,11 +492,16 @@ def rel(p: str) -> str:
     return p[len(root) + 1 :] if p.startswith(root + "/") else p
 
 
-target = rel(file_path)
+# First overlap wins — one warning names one concrete conflict, which is clearer than a list.
+target = None
 hit = None
-for task in work.get("tasks", []):
-    if any(rel(f) == target for f in task.get("files", [])):
-        hit = task
+for candidate in edit_paths:
+    c = rel(candidate)
+    for task in work.get("tasks", []):
+        if any(rel(f) == c for f in task.get("files", [])):
+            target, hit = c, task
+            break
+    if hit is not None:
         break
 if hit is None:
     sys.exit(0)

@@ -46,12 +46,31 @@ HOSTS_END="# <<< medley dashboard <<<"
 CLI_BEGIN="# >>> medley cli >>>"
 CLI_END="# <<< medley cli <<<"
 
+# This script's own dir, so it can call its siblings (strip-codex-config.py). Self-located rather
+# than taken from the environment: the uninstaller is often run directly from a shell, where no
+# ${CLAUDE_PLUGIN_ROOT} exists.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 LA_DIR="$HOME/Library/LaunchAgents"
 MEDLEY_DIR="$HOME/.medley"
-PLUGIN_DATA="$HOME/.claude/plugins/data/medley-medley"
-PLUGIN_CACHE="$HOME/.claude/plugins/cache/medley"
-PLUGIN_MARKET="$HOME/.claude/plugins/marketplaces/medley"
 SETTINGS="$HOME/.claude/settings.json"
+
+# This is the DEV-CHANNEL uninstaller, so every path below carries the dev marketplace name. Both
+# hosts derive their dirs as <plugin>-<marketplace> / <marketplace>, so one constant drives all five.
+# Names are enumerated EXPLICITLY — a bare `medley*` glob would eat a co-installed STABLE install (or
+# an unrelated plugin), and the two channels are meant to be independently removable.
+MARKET="medley-dev"
+CC_DATA="$HOME/.claude/plugins/data/medley-$MARKET"
+CC_CACHE="$HOME/.claude/plugins/cache/$MARKET"
+CC_MARKET="$HOME/.claude/plugins/marketplaces/$MARKET"
+# Codex: `codex plugin add` copies into ~/.codex/plugins/cache and gives hooks a real writable data
+# dir under ~/.codex/plugins/data — which is where the downloaded engine binaries land (~96MB), the
+# single biggest thing a Claude-only teardown used to leave behind.
+CX_DATA="$HOME/.codex/plugins/data/medley-$MARKET"
+CX_CACHE="$HOME/.codex/plugins/cache/$MARKET"
+CX_CONFIG="$HOME/.codex/config.toml"
+# Codex records the install across three table families in config.toml, all keyed by plugin@market.
+CX_PLUGIN_KEY="medley@$MARKET"
 
 uid="$(id -u)"
 
@@ -96,8 +115,13 @@ ENGINE=""
 for c in "${MEDLEY_ENGINE:-}" "$([ -f "$MEDLEY_DIR/engine-path" ] && cat "$MEDLEY_DIR/engine-path" 2>/dev/null)"; do
   [ -n "$c" ] && [ -x "$c" ] && { ENGINE="$c"; break; }
 done
-if [ -z "$ENGINE" ] && [ -d "$PLUGIN_DATA/bin" ]; then
-  ENGINE="$(find "$PLUGIN_DATA/bin" -maxdepth 1 -type f -name 'medley-engine-*' -perm -u+x 2>/dev/null | head -1)"
+if [ -z "$ENGINE" ]; then
+  # Either host may hold the binary — a Codex-only machine has it under ~/.codex.
+  for d in "$CC_DATA/bin" "$CX_DATA/bin"; do
+    [ -d "$d" ] || continue
+    ENGINE="$(find "$d" -maxdepth 1 -type f -name 'medley-engine-*' -perm -u+x 2>/dev/null | head -1)"
+    [ -n "$ENGINE" ] && break
+  done
 fi
 
 # ── detect what actually exists, so the plan is honest and sudo is only used when needed ───────────
@@ -106,6 +130,10 @@ pf_present=0; { [ -e "$PF_PLIST" ] || [ -e "$PF_CONF" ] || [ -e "$PF_ANCHOR" ]; 
 need_sudo=0; { [ "$hosts_has_block" = 1 ] || [ "$pf_present" = 1 ]; } && need_sudo=1
 
 stale_agents="$(find "$LA_DIR" -maxdepth 1 -name 'ai.getmedley.daemon.*.plist' 2>/dev/null || true)"
+
+cx_config_has_blocks=0
+if [ -f "$CX_CONFIG" ] && grep -qF "$CX_PLUGIN_KEY" "$CX_CONFIG" 2>/dev/null; then cx_config_has_blocks=1; fi
+if [ -f "$CX_CONFIG" ] && grep -qF "[marketplaces.$MARKET]" "$CX_CONFIG" 2>/dev/null; then cx_config_has_blocks=1; fi
 
 # ── plan ───────────────────────────────────────────────────────────────────────────────────────────
 say ""
@@ -121,9 +149,12 @@ if [ "$KEEP_DATA" = 1 ]; then
 else
   [ -d "$MEDLEY_DIR" ] && say "  • $MEDLEY_DIR   (mission DB + history + config)"
 fi
-[ -d "$PLUGIN_DATA" ]   && say "  • $PLUGIN_DATA   (downloaded engine binaries)"
-[ -d "$PLUGIN_CACHE" ]  && say "  • $PLUGIN_CACHE   (cached plugin versions)"
-[ -d "$PLUGIN_MARKET" ] && say "  • $PLUGIN_MARKET   (marketplace clone)"
+[ -d "$CC_DATA" ]   && say "  • $CC_DATA   (Claude Code: downloaded engine binaries)"
+[ -d "$CC_CACHE" ]  && say "  • $CC_CACHE   (Claude Code: cached plugin versions)"
+[ -d "$CC_MARKET" ] && say "  • $CC_MARKET   (Claude Code: marketplace clone)"
+[ -d "$CX_DATA" ]   && say "  • $CX_DATA   (Codex: downloaded engine binaries)"
+[ -d "$CX_CACHE" ]  && say "  • $CX_CACHE   (Codex: cached plugin versions)"
+[ "$cx_config_has_blocks" = 1 ] && say "  • medley entries in $CX_CONFIG   (plugin, marketplace, hook-trust)"
 grep -qF "$CLI_BEGIN" "$HOME/.zshrc" 2>/dev/null && say "  • medley cli alias block in ~/.zshrc"
 say ""
 
@@ -138,7 +169,9 @@ say ""; say "stopping the engine…"
 if [ -n "$ENGINE" ]; then act "$ENGINE service stop"; "$ENGINE" service stop >/dev/null 2>&1 || true; fi
 bootout "$LABEL_DAEMON"   # stop launchd relaunching it while we clean up
 pkill -f 'medley-engine-[0-9]'          2>/dev/null || true
-pkill -f 'plugins/data/medley-medley/'  2>/dev/null || true
+# No trailing slash: the dev channel's dir is `medley-medley-dev/`, which the old
+# 'plugins/data/medley-medley/' pattern silently missed. Matches both hosts and both channels.
+pkill -f 'plugins/data/medley-medley'   2>/dev/null || true
 
 # ── 2. launchd agents ────────────────────────────────────────────────────────────────────────────
 say "removing launchd agents…"
@@ -182,9 +215,26 @@ if [ "$KEEP_DATA" = 1 ]; then
 else
   rm_path "$MEDLEY_DIR"
 fi
-rm_path "$PLUGIN_DATA"
-rm_path "$PLUGIN_CACHE"
-rm_path "$PLUGIN_MARKET"
+rm_path "$CC_DATA"
+rm_path "$CC_CACHE"
+rm_path "$CC_MARKET"
+rm_path "$CX_DATA"
+rm_path "$CX_CACHE"
+
+# ── 4b. Codex config.toml: drop the three medley table families ─────────────────────────────────────
+# `codex plugin add` writes [plugins."medley@<market>"] (plus dotted sub-tables for per-tool approval
+# modes), [marketplaces.<market>], and one [hooks.state."medley@<market>:hooks/hooks.json:<event>:i:j"]
+# per hook event. None of it is removed by `codex plugin remove` on an already-deleted source, and a
+# stale hooks.state entry keeps a trust hash for a plugin that no longer exists.
+if [ "$cx_config_has_blocks" = 1 ]; then
+  if command -v python3 >/dev/null 2>&1 && [ -f "$DIR/strip-codex-config.py" ]; then
+    act "strip medley tables from $CX_CONFIG"
+    python3 "$DIR/strip-codex-config.py" "$CX_CONFIG" "$CX_PLUGIN_KEY" "$MARKET" \
+      || note "could not rewrite $CX_CONFIG — remove the medley tables by hand"
+  else
+    note "python3 not found — remove the [plugins.\"$CX_PLUGIN_KEY\"], [marketplaces.$MARKET] and [hooks.state.\"$CX_PLUGIN_KEY:…\"] tables from $CX_CONFIG by hand"
+  fi
+fi
 
 # ── 5. shell alias block(s) ────────────────────────────────────────────────────────────────────────
 strip_block() { # $1=file  $2=begin  $3=end
@@ -224,6 +274,9 @@ fi
 # ── done ─────────────────────────────────────────────────────────────────────────────────────────
 say ""
 say "medley: uninstalled."
-say "One thing this script can't touch safely — the plugin's entry in Claude Code's live registry:"
-say "  → run  /plugin uninstall medley  inside Claude Code (or it's a no-op if already gone)."
-say "Reinstall any time with:  /plugin install medley"
+say "One thing this script can't touch safely — the plugin's entry in a live host registry:"
+[ -d "$CC_CACHE" ] || [ -d "$CC_DATA" ] || [ -f "$SETTINGS" ] && \
+  say "  → Claude Code: run  /plugin uninstall medley  (a no-op if already gone)."
+[ "$cx_config_has_blocks" = 1 ] || [ -d "$CX_CACHE" ] && \
+  say "  → Codex: run  codex plugin remove medley@$MARKET  (a no-op if already gone)."
+say "Reinstall any time with:  /plugin install medley   ·   codex plugin add medley@$MARKET"

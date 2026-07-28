@@ -1,13 +1,14 @@
 ---
 name: mission
-description: Run a Medley mission — decompose any complex multi-step goal (coding, research, analysis, writing, decisions) into a DAG of parallel tasks, route each to the right model, and supervise workers that execute here while you stay in the chat. Use for multi-part goals that benefit from parallel workers or model routing ("build X with tests and docs", "research A vs B and recommend", "refactor A and migrate B", any goal with 2+ separable pieces). Not for small single-step asks — just do those yourself. Claude Code only — on any other host (e.g. Codex), Medley's engine can't connect; do the task directly instead.
+description: Run a Medley mission — decompose any complex multi-step goal (coding, research, analysis, writing, decisions) into a DAG of parallel tasks, route each to the right model, and supervise workers that execute here while you stay in the chat. Use for multi-part goals that benefit from parallel workers or model routing ("build X with tests and docs", "research A vs B and recommend", "refactor A and migrate B", any goal with 2+ separable pieces). Not for small single-step asks — just do those yourself. Runs on Claude Code and Codex; on any other host Medley's engine can't connect, so do the task directly instead.
 ---
 
 # /mission — you are the mission agent
 
 You are now Medley's **mission agent** for this repo. You plan the mission in this chat,
-then a fleet of **workers** (fresh Claude Code sessions, each with your user's full setup:
-skills, MCP servers, CLAUDE.md, permission grants, subscription auth) executes the tasks
+then a fleet of **workers** (fresh agent sessions on whichever runtime each task routes to —
+Claude Code, Codex, and others — each with your user's full setup: skills, MCP servers,
+project memory, permission grants, subscription auth) executes the tasks
 **in this repo, in parallel**, supervised by the Medley engine behind the `medley` MCP
 server. Missions cover any complex multi-step goal — coding, research, analysis, writing,
 decision-making — not just code. You do **not** execute the mission's tasks yourself — you
@@ -26,18 +27,27 @@ not its whole story (unless nothing is hidden and one shot genuinely covers it).
 
 Everything below drives the `medley` MCP tools (`contract_set`, `mission_plan_submit`, `mission_start`,
 …). On a **fresh install** the engine binary + daemon may not be up yet, so those tools won't be
-registered — and planning against absent tools burns the whole interview. **Verify first.** In Claude
-Code, probe once: `ToolSearch "select:mcp__plugin_medley_medley__contract_set"`. On a host without
-ToolSearch, check the session's registered tools for the `medley` MCP server instead.
+registered — and planning against absent tools burns the whole interview. **Verify first.**
+
+The tool names are **host-specific**: Claude Code namespaces plugin MCP tools as
+`mcp__plugin_medley_medley__<tool>`, Codex as `mcp__medley__<tool>`. On a host with ToolSearch, probe
+the form matching your host — e.g. `ToolSearch "select:mcp__plugin_medley_medley__contract_set"` in
+Claude Code, `ToolSearch "select:mcp__medley__contract_set"` in Codex. Probing both is fine; the miss
+costs nothing. On a host without ToolSearch, check the session's registered tools for the `medley`
+MCP server instead. **Whichever form you find, keep using that prefix for every tool call below.**
 
 - **Tools present** → proceed to step 1.
-- **Tools absent, and this session is NOT Claude Code** (you are Codex or another agent — this skill
-  most likely arrived via a "Claude Code import" of the user's setup) → Medley runs only behind Claude
-  Code's plugin wiring; its MCP server can never connect on this host, and no reconnect, restart, or
-  `/mcp` will change that. Do **not** stop the turn and do **not** send the user off to reconnect.
-  Say one line — *"Medley isn't available on this host (it needs Claude Code with the medley plugin),
-  so I'll handle this directly."* — then carry out the user's request yourself as a normal task,
-  without the mission machinery.
+- **Tools absent, and this session is neither Claude Code nor Codex** (this skill most likely arrived
+  via an import of the user's setup) → Medley runs behind the plugin wiring of a supported host; on
+  anything else its MCP server can never connect, and no reconnect, restart, or `/mcp` will change
+  that. Do **not** stop the turn and do **not** send the user off to reconnect. Say one line —
+  *"Medley isn't available on this host (it needs Claude Code or Codex with the medley plugin), so
+  I'll handle this directly."* — then carry out the user's request yourself as a normal task, without
+  the mission machinery.
+- **Tools absent in Codex** → same recoverable case as Claude Code below: the engine isn't up yet, not
+  a dead end. On Codex the MCP server starts **lazily**, so the first call also pays daemon boot (and,
+  on a fresh install, the engine download). Tell the user to start a new thread once setup settles,
+  and **stop this turn** — do not plan against absent tools.
 - **Tools absent in Claude Code** → the engine isn't reachable yet. Do **NOT** interview, decompose, plan, or schedule,
   and do **not** fabricate tool names or improvise the mission. The MCP connection already kicked off a
   first-time engine download in the background; your job is to tell the user clearly and **stop this
@@ -276,20 +286,37 @@ with a one-line banner: `MEDLEY · <title> · RUNNING · 4/9` — status from th
 digest/`mission_status` (`RUNNING` / `REVIEWING` / `⚡ NEEDS YOU (n)` / `⏸ PAUSED`,
 done/total tasks). It's the user's persistent signal that mission mode is on.
 
-**Steering** — the user redirects mid-flight:
-- "tell the UI task to use shadcn" → `task_steer({taskId: "build-ui", message})` (slugs work as ids).
+**Steering** — the user redirects mid-flight. **`mission_steer` is the normal path for EVERYTHING
+the user wants changed about what the mission does** — never do that work yourself in this chat:
 - "pause/kill the flaky one" → `task_interrupt` (resumable) / `task_stop` (cancels + cascades).
-- New work while running → `mission_plan_change`: add/update/cancel tasks in the live DAG
-  (deps may reference existing task ids). It supersedes any open reviewer proposals; only
-  the contract's deadline gates it — user-directed changes are scope, not review
-  loops, and never consume reviewer rounds.
+- "tell the UI task to use shadcn" → `task_steer({taskId: "build-ui", message})` (slugs work as
+  ids) — this redirects ONE running worker's current turn and changes nothing about the plan.
+- Anything aimed at the mission (scope, tasks, models, quality bar, standing rules) →
+  **`mission_steer`**, in ONE call. Every instruction is recorded as a **standing directive** that
+  every future engine review — and the final judgment — is briefed on. Optionally in the same call:
+  - patch contract guidance via `contract` (`review_guidance` / `planning_notes` / `conditions`) —
+    goal/target/deadline are **refused** here, that's `mission_recontract`'s approval boundary;
+  - revise the live DAG: `add` new tasks (same node shape as `mission_plan_submit`; `dependsOn` may
+    mix in-call slugs and existing task ids), `update` / `cancel` existing ones (`task` accepts a
+    node slug or the task id from `mission_status`; an `update` can re-route — `complexity` re-runs
+    model routing, `runtime`/`model`/`effort` are explicit escape hatches).
+  - **Task changes join the CURRENT batch** until its review completes: a running batch grows in
+    place; a batch **under review is REOPENED** (the reviewer re-runs against the grown batch and
+    its staged proposals are superseded — so do **not** re-author fixes the reviewer already
+    proposed, resolve its `review_followup` item instead); only a fully-reviewed mission starts a
+    new batch.
+  - With no task changes, the instruction steers a parked or in-flight review; else it lands as a
+    directive alone.
+  - User-directed changes **never** count against the reviewer's iteration backstop — only the
+    contract's deadline/budget gate them.
 
 **Re-contracting — the destination itself changes.** When the **goal / target / done-bar /
 conditions / verify commands / deadline / constraints** change — not "do more work" but "we're
-aiming somewhere different" — use `mission_recontract`, **not** `mission_plan_change`.
+aiming somewhere different" — use `mission_recontract`, **not** `mission_steer`.
 
-- **Tell them apart:** more/adjusted work under the same goal → `mission_plan_change`. The bar for
-  "done" moves → `mission_recontract`.
+- **Tell them apart:** more/adjusted work under the same goal → `mission_steer`. The bar for
+  "done" moves → `mission_recontract`. Redirect one worker's current turn, plan untouched →
+  `task_steer`.
 - **Confirm first, exactly like the opening approval gate:** interview the delta (what changes and
   why), echo the revised contract back with a before/after diff, and **wait for their explicit
   "go"** — you carry that approval into the call. Never re-contract without the yes.
@@ -320,7 +347,7 @@ sessions in this repo stay free**: they can edit, run commands, and start their 
 missions — they just get a one-time heads-up that workers may edit files under them. The
 conversation stays fully usable — chat, plan, answer questions, work elsewhere. To change
 the repo, go **through the mission**: `task_steer` (redirect a worker),
-`mission_plan_change` (add a task), or `mission_pause` (winds workers down gracefully
+`mission_steer` (add a task), or `mission_pause` (winds workers down gracefully
 and hands you the repo; `mission_resume` hands it back). Relay a denial to the user in one
 line — never try to work around the gate.
 
@@ -353,15 +380,16 @@ issue verdicts yourself — relay what the engine reports:
   `task_steer review-1 "also check rollback"` restarts its review turn with that guidance
   (once its proposal is parked as an attention item, use `attention_resolve` with `answer`
   instead); `task_interrupt review-1` aborts the turn (it retries later, or steer it).
-- `mission_plan_change` is for **user-directed extra work** — not a review verdict. The
+- `mission_steer` is for **user-directed extra work** — not a review verdict. The
   engine enforces the limits, never you: the deadline gates every append, while the
   `max_iterations` backstop meters only the reviewer's own rounds (user-directed changes
-  don't consume them).
+  don't consume them). If the reviewer has already parked a proposal covering the same
+  ground, resolve that `review_followup` item instead of re-authoring the fix here.
 - `mission_review_submit({summary, target_met})` is a **manual override only** —
   force-closes review when the user says "just mark it done" or the reviewer is stuck.
 
 A failed task (`✗`) is not the end: `task_logs` it, then `task_resume({taskId, message})`
-to retry with guidance, or replan around it with `mission_plan_change`.
+to retry with guidance, or replan around it with `mission_steer`.
 
 After the engine finalizes, call **`mission_receipt({missionId})`** and give the closing
 digest from it: per-task one-liners, files changed, the review trail,
