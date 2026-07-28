@@ -27,9 +27,16 @@ Design + rationale: `docs/superpowers/specs/2026-07-28-medley-dev-channel-design
   Codex-only files (new here, absent from stable):
   - `plugin/.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json`
   - `plugin/scripts/medley-mcp.sh` — fixed-path MCP launcher (no plugin env on that host)
-  - `plugin/scripts/mission-watch-gate.py` + `test_mission_watch_gate.py` — the Codex **supervision
-    channel**; Codex has no wake-on-exit, so a `Stop` hook blocks turn-end and hands the agent the
-    digest instead. No-ops on Claude Code, where the background watcher already works.
+  - `plugin/scripts/mission-watch-gate.py` + `test_mission_watch_gate.py` — the Codex supervision
+    **backstop**. Codex has no wake-on-exit, so its agent supervises by LOOPING `mission_wait` inside
+    one long turn (viable only because Codex, unlike Claude Code, accepts user input mid-turn). This
+    hook exists for the one thing that loop can't guarantee — a model leaving it early — and blocks
+    turn-end to push the agent back in. It reads on-disk state only: no engine, no daemon, no `watch`
+    subprocess (the earlier version held the turn up to 25s to re-deliver a digest `mission_wait`
+    already returns instantly). No-ops on Claude Code, where the background watcher owns supervision.
+  - `plugin/skills/mission/hosts/{claude-code,codex}.md` — per-host supervision rationale, read on
+    demand. `mission_start`'s response is the authoritative instruction (the engine knows the host);
+    these files exist so `SKILL.md` doesn't make every session pay for the other host's rules.
   - `plugin/scripts/strip-codex-config.py` + `test_strip_codex_config.py` — teardown of the
     `[plugins."medley@…"]` / `[marketplaces.…]` / `[hooks.state."medley@…"]` tables in
     `~/.codex/config.toml`
@@ -197,5 +204,6 @@ plugin/scripts/                   {resolve,ensure,run}-engine.sh, session-start.
                                   mission-watch-gate.py (Codex Stop-hook watcher),
                                   strip-codex-config.py (uninstall: ~/.codex/config.toml tables)
 plugin/engine/version             engine version pin (release-managed)
-plugin/skills/mission|dashboard   the /mission and /dashboard skills (+ runtimes/ routing guides)
+plugin/skills/mission|dashboard   the /mission and /dashboard skills (+ runtimes/ routing guides and
+                                  mission/hosts/ per-host supervision guides, both read on demand)
 ```

@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-# Stop hook — THE CODEX SUPERVISION CHANNEL.
+# Stop hook — THE CODEX SUPERVISION BACKSTOP.
 #
 # Why this exists. On Claude Code the mission agent arms the engine's `watch` as a BACKGROUND Bash
 # task and ends its turn; the harness re-invokes it when that process exits, which is how digests
 # reach the agent with zero context cost while idle. Codex 0.145 has no equivalent: its async exec
 # cells must be collected by the model calling `wait(cell_id)`, and nothing re-enters a thread when a
-# process finishes. Surveyed alternatives (`sleep` — in-turn only; `spawn_agent`/`wait_agent` — a
-# mailbox, but only for Codex's own sub-agents; `remote-control` app-server turn injection —
-# experimental, needs a paired daemon) all fail for a plugin.
+# process finishes. Surveyed alternatives (`sleep` — in-turn only; `spawn_agent`/`wait_agent` — the
+# parent blocks on `wait_agent`, so it buys the same held turn while paying a second model;
+# `remote-control` app-server turn injection — needs the TUI attached to a shared app-server) all
+# fail for a plugin.
 #
-# What DOES work is the `Stop` hook: returning {"decision":"block","reason":...} prevents the turn
-# from ending and hands `reason` to the model as a continuation prompt. So instead of waking the
-# agent later, we hold the turn open just long enough to see whether anything landed.
+# So Codex supervises the other way round: the agent LOOPS `mission_wait` inside one long-lived turn
+# (the engine's `mission_start` tells it to, and the mission skill's §4 Codex branch repeats it). That
+# works because Codex — unlike Claude Code — lets the user type into a running turn, so a long turn
+# doesn't lock the conversation.
+#
+# This hook is therefore NOT the primary channel any more. It is the backstop for the one thing that
+# loop can't guarantee: a model deciding it's done supervising while the mission is still live. The
+# `Stop` hook is the only re-entry a plugin gets, and `{"decision":"block","reason":...}` hands the
+# model a continuation prompt — so we use it to push the agent BACK INTO the loop rather than to
+# deliver digests. Digest delivery belongs to `mission_wait`, which also streams live progress to the
+# user and can raise an approval as a native prompt; neither is possible from here.
 #
 # Two honest limits, by construction:
-#   • It only fires when the model TRIES to stop — so it supervises a bounded window after each turn,
-#     never indefinitely. Once a turn genuinely ends, nothing a plugin can reach re-enters the thread.
-#   • It holds the turn open while waiting, so the window must stay short (see WATCH_TIMEOUT).
+#   • It only fires when the model TRIES to stop — so it catches an early exit from the loop, not an
+#     idle thread. Once a turn genuinely ends, nothing a plugin can reach re-enters it.
+#   • It holds the turn open while it checks, so the check must stay short (see WATCH_TIMEOUT).
 #
 # CLAUDE CODE MUST NOT RUN THIS. There the background watcher already works, is cheaper, and does not
 # hold a turn open; running both would double-supervise. The host gate below is load-bearing, not
@@ -26,15 +35,7 @@
 # exits 0 and the turn ends normally. A supervision channel must never be able to trap a turn.
 import json
 import os
-import re
-import subprocess
 import sys
-
-# How long to hold the turn open waiting for activity. Must stay BELOW the hook's own `timeout` in
-# hooks.json or Codex kills us mid-wait and the digest is lost. Codex's effective cap is not
-# documented in the binary (`timeout` is a HookHandlerConfig field and at least SessionEnd gets
-# clamped), so this is deliberately conservative and overridable for experimentation.
-WATCH_TIMEOUT = int(os.environ.get("MEDLEY_STOP_WATCH_TIMEOUT", "25"))
 
 # Mirrors the engine's ACTIVE_MISSION_STATUSES and edit-conflict-gate.py's copy. 'paused' is
 # deliberately absent: a paused mission has no live workers, so there is nothing to report.
@@ -116,49 +117,6 @@ def supervises(repo: str, session_id, missions) -> bool:
     return any(m["id"] in recorded for m in missions)
 
 
-def resolve_engine(script_dir: str):
-    """Delegate to resolve-engine.sh so there is ONE resolution order in the plugin. Codex does give
-    hook processes the plugin env, so ${CLAUDE_PLUGIN_DATA} is available here."""
-    resolver = os.path.join(script_dir, "resolve-engine.sh")
-    if not os.path.exists(resolver):
-        return None
-    try:
-        proc = subprocess.run([resolver], capture_output=True, text=True, timeout=10)
-    except Exception:
-        return None
-    path = proc.stdout.strip()
-    return path if proc.returncode == 0 and path and os.path.exists(path) else None
-
-
-def run_watch(engine: str, repo: str):
-    """Run the engine's read-only `watch` and return its digest lines, or None.
-
-    `watch` exits as soon as digest-worthy activity lands (or at its own timeout), so this returns
-    fast when something happened and slow-but-bounded when nothing did. CLAUDE_PROJECT_DIR scopes it
-    to THIS repo's missions — the shared daemon's event log spans every repo, and without it we would
-    relay another repo's worker activity into this thread.
-    """
-    env = dict(os.environ)
-    env["CLAUDE_PROJECT_DIR"] = repo
-    cmd = [engine, "watch", "--timeout", str(WATCH_TIMEOUT)]
-    if engine.endswith((".cjs", ".js", ".mjs")):
-        cmd = ["node"] + cmd  # dev build
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=WATCH_TIMEOUT + 10
-        )
-    except Exception:
-        return None
-    out = (proc.stdout or "").strip()
-    if not out:
-        return None
-    # A timeout with no activity still prints a heartbeat/backstop line. Blocking the turn on that
-    # would loop the agent on nothing, so require at least one line carrying a digest marker.
-    if not re.search(r"[✓✗⚡🔍⏸]|review-\d|needs you", out, re.IGNORECASE):
-        return None
-    return out
-
-
 def main() -> int:
     if os.environ.get("MEDLEY_WORKER") == "1":
         return 0  # a worker never supervises
@@ -187,28 +145,35 @@ def main() -> int:
     if not supervises(repo, payload.get("session_id"), missions):
         return 0
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    engine = resolve_engine(script_dir)
-    if not engine:
-        return 0
-
-    digest = run_watch(engine, repo)
-    if not digest:
-        return 0
-
+    # A live mission, and the session that supervises it is trying to stop — i.e. it left the
+    # mission_wait loop early. Push it back in.
+    #
+    # Deliberately NO engine call here. The old version ran `watch` for up to 25s and blocked only if
+    # a digest landed, which cost a held turn on every single stop attempt and could still deliver a
+    # digest the agent had already seen. mission_wait returns anything buffered IMMEDIATELY, so
+    # re-entering the loop delivers the same content faster — and it also re-opens the two channels
+    # only reachable from inside that tool call: live progress to the user, and raising an ⚡ item as a
+    # native prompt. Digest delivery is mission_wait's job; getting the agent back there is ours.
+    #
+    # The `stop_hook_active` guard above bounds this to ONE nudge per turn, so a model that genuinely
+    # cannot continue is never trapped.
     title = missions[0].get("title") or "the mission"
     print(
         json.dumps(
             {
                 "decision": "block",
                 "reason": (
-                    "Medley mission activity — relay this to the user in one or two lines, act on "
-                    "anything that needs them (attention_list / attention_resolve for ⚡ items, "
-                    "the review loop for \U0001f50d verdicts), then continue supervising. Do NOT try "
-                    "to background a watcher on this host; supervision is automatic. Use "
-                    "mission_status for the full picture, or mission_wait if the user asks to block "
-                    "until done.\n\n"
-                    'Mission "%s":\n%s' % (title, digest)
+                    'Medley mission "%s" is still live and you are its supervisor — you stopped '
+                    "before it finalized. Resume supervising now: call mission_wait, relay what it "
+                    "returns to the user in ONE line, and keep calling it until the mission "
+                    "finalizes. Do NOT background a watcher on this host (there is no wake-on-exit, "
+                    "so it would never be collected) and do not end your turn while the mission is "
+                    "live — the user can type to you mid-turn. Anything waiting on them (⚡) may come "
+                    "back from mission_wait already resolved, because the engine can prompt them "
+                    "directly while you wait; use attention_list / attention_resolve for whatever "
+                    "is still open, and mission_status for the full picture. If the user asked you "
+                    "to stop, use mission_pause or mission_stop rather than just ending the turn."
+                    % title
                 ),
             }
         )
