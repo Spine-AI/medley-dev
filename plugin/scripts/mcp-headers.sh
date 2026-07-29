@@ -34,6 +34,25 @@ VERSION_FILE="${CLAUDE_PLUGIN_ROOT:-}/engine/version"
 PIN_HDR=""
 [ -n "$PIN" ] && PIN_HDR=",\"X-Medley-Engine-Pin\":\"${PIN}\""
 
+# The terminal this session runs in, sent as X-Medley-Terminal. The DAEMON has no terminal of its own
+# (launchd-spawned), and this helper is the only Medley code that both runs under the user's terminal
+# and talks to the daemon once per session — so it is the only place the terminal dimension on
+# `session_started` can come from. TERM_PROGRAM covers most; kitty and alacritty set none, so fall
+# back to their marker vars using the same token names terminal-caps.ts expects (keep the two in
+# step). Value is a bare token — no version, no session id. Sanitized to [A-Za-z0-9._-] so nothing
+# from the environment can break the JSON this must print.
+TERMTOK="${TERM_PROGRAM:-}"
+if [ -z "$TERMTOK" ]; then
+  if [ -n "${KITTY_WINDOW_ID:-}" ]; then
+    TERMTOK="kitty"
+  elif [ -n "${ALACRITTY_SOCKET:-}${ALACRITTY_WINDOW_ID:-}" ]; then
+    TERMTOK="alacritty"
+  fi
+fi
+TERMTOK="$(printf '%s' "$TERMTOK" | tr -cd 'A-Za-z0-9._-' | cut -c1-32)"
+TERM_HDR=""
+[ -n "$TERMTOK" ] && TERM_HDR=",\"X-Medley-Terminal\":\"${TERMTOK}\""
+
 read_token() { tr -d ' \t\n\r' < "$TOKENFILE" 2>/dev/null; }
 is_token() { printf '%s' "$1" | grep -qE '^[0-9a-f]{32}$'; }
 
@@ -85,4 +104,4 @@ if ! curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
   ) &
 fi
 
-printf '{"Authorization":"Bearer %s"%s}\n' "$TOKEN" "$PIN_HDR"
+printf '{"Authorization":"Bearer %s"%s%s}\n' "$TOKEN" "$PIN_HDR" "$TERM_HDR"

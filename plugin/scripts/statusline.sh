@@ -74,20 +74,26 @@ repo=$(printf '%s' "$input" | sed -n 's/.*"project_dir"[[:space:]]*:[[:space:]]*
 # Short-TTL per-repo cache. Within TTL seconds serve the cached line (a file read, no engine); only a
 # miss cold-starts the engine — so engine spawns are bounded to ≤ once / TTL / repo regardless of how
 # fast Claude Code ticks. Staleness ≤ TTL (default 2s — imperceptible). MEDLEY_STATUSLINE_TTL=0 disables
-# it (tests / opt-out). The cache file stores the repo path on line 1 and the rendered line as the
-# remainder; a hit is served ONLY when line 1 matches this repo, so a cksum key collision can never
+# it (tests / opt-out). The cache file stores the repo⇥terminal identity on line 1 and the rendered
+# line as the remainder; a hit is served ONLY when line 1 matches, so a cksum key collision can never
 # leak one repo's mission into another. Freshness is pure bash + stat/date (BSD/macOS — Medley is mac-only).
 TTL="${MEDLEY_STATUSLINE_TTL:-2}"
 case "$TTL" in ''|*[!0-9]*) TTL=2 ;; esac   # non-integer override → safe default (avoids arithmetic errors)
 CACHE_DIR="${MEDLEY_DATA_DIR:-$HOME/.medley/state}/sl-cache"
-key=$(printf '%s' "$repo" | cksum | cut -d' ' -f1)
+# The cache identity is repo + TERMINAL, not repo alone: the rendered line is now terminal-dependent
+# (the engine emits a clickable OSC-8 `⌘ dashboard` only where the terminal renders one, else
+# `/dashboard for UI` — see terminal-caps.ts). Two Claude Code windows on the SAME repo in different
+# terminals would otherwise trade each other's line every TTL seconds. Tab-joined; a false MISMATCH
+# is merely a cache miss (safe), and only an exact match serves a hit.
+ident=$(printf '%s\t%s' "$repo" "${TERM_PROGRAM:-}")
+key=$(printf '%s' "$ident" | cksum | cut -d' ' -f1)
 cache="$CACHE_DIR/$key"
 if [ "$TTL" -gt 0 ] && [ -f "$cache" ]; then
   mtime=$(stat -f %m "$cache" 2>/dev/null || echo 0)
   now=$(date +%s)
   if [ $(( now - mtime )) -lt "$TTL" ]; then
-    IFS= read -r cached_repo < "$cache"   # line 1 = the repo this cache entry is for (bash builtin, no exec)
-    if [ "$cached_repo" = "$repo" ]; then tail -n +2 "$cache"; exit 0; fi   # HIT: verified same repo
+    IFS= read -r cached_ident < "$cache"   # line 1 = repo⇥terminal this entry is for (bash builtin, no exec)
+    if [ "$cached_ident" = "$ident" ]; then tail -n +2 "$cache"; exit 0; fi   # HIT: verified same repo+terminal
   fi
 fi
 
@@ -103,6 +109,6 @@ fi
 if [ "$TTL" -gt 0 ]; then
   mkdir -p "$CACHE_DIR" 2>/dev/null || true
   tmp="$cache.tmp.$$"
-  printf '%s\n%s' "$repo" "$out" > "$tmp" 2>/dev/null && mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  printf '%s\n%s' "$ident" "$out" > "$tmp" 2>/dev/null && mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
 fi
 printf '%s' "$out"
