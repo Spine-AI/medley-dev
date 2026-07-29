@@ -59,6 +59,33 @@ out="$(run "$tmp/plugin/scripts/mcp-gateway.sh" "$DATA")"
 assert_contains "$out" "GATEWAY[pinned]:mcp --gateway" "plugin-dir pin resolves + passes --gateway"
 assert_missing "$out" "GATEWAY[older]" "plugin dir wins over the codex breadcrumb"
 
+# 1b. THE CLAUDE-PATH GUARANTEE. Every fixed-path fallback must be dead code when we were launched from
+#     a plugin dir. With ALL THREE breadcrumbs pointing at a different (older) engine, the plugin pin
+#     must still win — an engine-override leaking in here would hand CC's gateway an older binary, and
+#     an older binary ignores `--gateway` and serves the ORCHESTRATOR under the gateway's name.
+mk_engine "$tmp/stale-override" "stale-override"
+printf '%s\n' "$tmp/stale-override" > "$tmp/.medley/engine-override"
+printf '%s\n' "0.0.1" > "$tmp/.medley/codex-engine-pin"
+printf '%s\n' "$DATA" > "$tmp/.medley/codex-plugin-data"
+out="$(run "$tmp/plugin/scripts/mcp-gateway.sh" "$DATA")"
+assert_contains "$out" "GATEWAY[pinned]:mcp --gateway" "plugin dir ignores all fixed-path fallbacks"
+assert_missing "$out" "GATEWAY[stale-override]" "engine-override never reaches the claude path"
+#     …and with NO datadir arg either, the plugin path must NOT silently borrow codex-plugin-data.
+out="$(run "$tmp/plugin/scripts/mcp-gateway.sh")"
+assert_missing "$out" "GATEWAY" "plugin dir with no datadir refuses rather than using the crumb"
+
+# 1c. REGRESSION (caught by A/B against the pre-change file). An UNPINNED plugin dir — engine/version
+#     unreadable, e.g. a --plugin-dir checkout mid-edit or a half-materialized cache — must REFUSE,
+#     exactly as it did before the fallbacks existed. It must never fall through to the Codex
+#     breadcrumbs and launch whatever that cache holds. "Which copy am I" is answered by LOCATION, not
+#     by "did I find a pin", precisely so these two cases stay distinct.
+mv "$tmp/plugin/engine/version" "$tmp/plugin/engine/version.hidden"
+out="$(run "$tmp/plugin/scripts/mcp-gateway.sh" "$DATA")"
+assert_missing "$out" "GATEWAY" "unpinned plugin dir refuses instead of using the codex breadcrumb"
+assert_contains "$(cat "$tmp/err")" "needs engine v?" "unpinned plugin dir reports an unknown pin"
+mv "$tmp/plugin/engine/version.hidden" "$tmp/plugin/engine/version"
+rm -f "$tmp/.medley/engine-override"
+
 # 2. Codex layout: no args, no plugin env — both halves come from the breadcrumbs.
 printf '%s\n' "$PIN" > "$tmp/.medley/codex-engine-pin"
 printf '%s\n' "$DATA" > "$tmp/.medley/codex-plugin-data"
@@ -82,6 +109,10 @@ out="$(run "$tmp/.medley/bin/medley-gateway")"; rc=$?
 [ "$rc" = 1 ] || { echo "FAIL [no breadcrumb exits 1]: got $rc"; fail=1; }
 assert_contains "$(cat "$tmp/err")" "SessionStart hook has not run yet" "refusal explains the hook"
 assert_missing "$(cat "$tmp/err")" "command not found" "no rescue attempted from the fixed path"
+# REGRESSION: `< missing_file` failures are reported by the SHELL, so `2>/dev/null` on the command does
+# NOT suppress them. Every breadcrumb read is `[ -f ]`-guarded so this ordinary first-run path emits no
+# spurious diagnostics into the channel the host logs.
+assert_missing "$(cat "$tmp/err")" "No such file or directory" "absent breadcrumbs emit no shell noise"
 if [ -e "$tmp/rescue-ran" ]; then echo "FAIL [no rescue from fixed path]"; fail=1; fi
 
 # 5. The plugin-dir copy DOES rescue via ensure-engine.sh when the pinned binary is missing.

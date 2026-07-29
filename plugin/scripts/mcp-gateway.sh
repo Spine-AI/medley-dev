@@ -38,9 +38,6 @@ MEDLEY_HOME="${HOME:-/nonexistent}/.medley"
 # to read here. That is the whole reason the gateway can keep its pin-strict rule on that host
 # instead of being routed through medley-mcp.sh, which only tracks the newest installed engine.
 DATADIR="${1:-${CLAUDE_PLUGIN_DATA:-}}"
-if [ -z "$DATADIR" ]; then
-  DATADIR="$(cat "$MEDLEY_HOME/codex-plugin-data" 2>/dev/null || true)"
-fi
 
 # The pin is read from OUR OWN location first, not from $CLAUDE_PLUGIN_ROOT. Measured: CC DOES set
 # that env var for a stdio MCP server (verified via --plugin-dir), so reading it would work — but the
@@ -56,31 +53,62 @@ for root in "$PLUGIN_ROOT" "${CLAUDE_PLUGIN_ROOT:-}"; do
     if [ -n "$VERSION" ]; then break; fi
   fi
 done
-# Fixed-path fallback for the no-plugin-env host: when this file runs from ~/.medley/bin, `..` is
-# ~/.medley and holds no engine/version, so we land here. The breadcrumb carries the PIN VALUE and
-# deliberately NOT a plugin root: a root would point into the VERSIONED Codex plugin cache
-# (…/cache/<market>/medley/<ver>/), which Codex renames and prunes whenever the source manifest's
-# version changes — precisely the dangling-path failure that made session-start.sh exit 127 and
-# turned a missing edit-conflict-gate.py into a "PreToolUse denied". A pin is just a string: it can
-# go STALE but never dangle, and stale fails closed (the binary for that version isn't there, so we
-# refuse below) rather than executing something unexpected. SessionStart rewrites it at thread start,
-# before any tool call can reach the gateway.
-if [ -z "$VERSION" ]; then
-  VERSION="$(tr -d ' \t\n\r' < "$MEDLEY_HOME/codex-engine-pin" 2>/dev/null || true)"
-fi
 
-# The local-build pin used by scripts/codex-dev-install.sh. Honored here for the same reason
-# medley-mcp.sh honors it: on Codex there is no way to pass $MEDLEY_ENGINE to an MCP server, so a
-# developer testing a local engine would otherwise get a local-build mission proxy and a
-# downloaded-binary gateway in the same session. Both entries are explicit developer overrides and
-# rank above the pin — a dev who points these at an old build owns that choice.
-OVERRIDE="$(cat "$MEDLEY_HOME/engine-override" 2>/dev/null || true)"
+# WHICH COPY AM I? Asked structurally — by location — and NOT inferred from "did I find a pin". Those
+# are different questions and conflating them is a live hazard: a plugin dir whose engine/version is
+# momentarily unreadable (a --plugin-dir checkout mid-edit, a partially materialized cache) would
+# otherwise fall through to the Codex breadcrumbs and launch whatever engine THAT cache holds — an
+# older binary ignores `--gateway` and serves the ORCHESTRATOR under the gateway's name, the exact
+# failure this script exists to prevent. Baseline behavior for an unpinned plugin dir is to REFUSE, and
+# it must stay that way. Both sides are resolved through `cd && pwd` so a symlinked $HOME still matches.
+FIXED_DIR="$(cd "$MEDLEY_HOME/bin" 2>/dev/null && pwd || true)"
+IS_FIXED_PATH=""
+if [ -n "$FIXED_DIR" ] && [ "$DIR" = "$FIXED_DIR" ]; then IS_FIXED_PATH=1; fi
+# ── FIXED-PATH FALLBACKS ────────────────────────────────────────────────────────────────────────────
+# Everything in this block is reached ONLY by the fixed-path copy at ~/.medley/bin/medley-gateway, the
+# one a host with no plugin env (Codex) launches. Claude Code always launches the copy inside the plugin
+# dir, so on that path this block is DEAD CODE and resolution stays byte-identical to what shipped
+# before it existed — verified by A/B against the pre-change file across every scenario CC can produce.
+# One gate, checked once, covering all three fallbacks, so no future edit can leak one of them onto the
+# Claude path by accident.
+#
+#   codex-engine-pin  — the PIN VALUE, deliberately NOT a plugin root. A root would point into the
+#     VERSIONED Codex cache (…/cache/<market>/medley/<ver>/), which Codex renames and prunes whenever
+#     the source manifest's version changes — precisely the dangling-path failure that made
+#     session-start.sh exit 127 and turned a missing edit-conflict-gate.py into a "PreToolUse denied".
+#     A pin is just a string: it can go STALE but never dangle, and stale fails closed (the binary for
+#     that version isn't there, so we refuse below). SessionStart rewrites it at thread start, before
+#     any tool call can reach the gateway.
+#   codex-plugin-data — the data dir holding the downloaded binaries. Safe to store as a path: unlike
+#     the plugin cache, ~/.codex/plugins/data/<plugin>-<marketplace> is not versioned.
+#   engine-override   — the local-build pin `codex-dev-install.sh` writes, since $MEDLEY_ENGINE cannot
+#     be passed to an MCP server on this host. Kept off the Claude path because a stale override would
+#     hand CC's gateway an older binary, and an older binary ignores `--gateway` and serves the
+#     ORCHESTRATOR under the gateway's name — the exact failure the pin-strict rule exists to prevent.
+#     ($MEDLEY_ENGINE stays unconditional below: it was already honored on both paths beforehand.)
+OVERRIDE=""
+if [ -n "$IS_FIXED_PATH" ]; then
+  # `[ -f ]` before every read: with `< missing_file` the failure is reported by the SHELL, not by the
+  # command, so `2>/dev/null` on `tr` does NOT suppress it and a "No such file or directory" line leaks
+  # onto stderr — noise in a channel the host logs, on the ordinary first-run path.
+  if [ -f "$MEDLEY_HOME/codex-engine-pin" ]; then
+    VERSION="$(tr -d ' \t\n\r' < "$MEDLEY_HOME/codex-engine-pin" 2>/dev/null)"
+  else
+    VERSION=""
+  fi
+  if [ -z "$DATADIR" ] && [ -f "$MEDLEY_HOME/codex-plugin-data" ]; then
+    DATADIR="$(tr -d ' \t\n\r' < "$MEDLEY_HOME/codex-plugin-data" 2>/dev/null)"
+  fi
+  if [ -f "$MEDLEY_HOME/engine-override" ]; then
+    OVERRIDE="$(tr -d ' \t\n\r' < "$MEDLEY_HOME/engine-override" 2>/dev/null)"
+  fi
+fi
 
 ENGINE=""
 if [ -n "${MEDLEY_ENGINE:-}" ] && [ -f "${MEDLEY_ENGINE}" ]; then
   ENGINE="${MEDLEY_ENGINE}" # explicit dev override (a local .cjs or binary)
 elif [ -n "$OVERRIDE" ] && [ -f "$OVERRIDE" ]; then
-  ENGINE="$OVERRIDE"        # ~/.medley/engine-override — the Codex dev loop's local-build pin
+  ENGINE="$OVERRIDE"        # ~/.medley/engine-override — fixed-path only (Codex dev loop)
 elif [ -n "$VERSION" ] && [ -n "$DATADIR" ]; then
   ENGINE="${DATADIR}/bin/medley-engine-${VERSION}"
   # The rescue below needs ensure-engine.sh NEXT TO US, which is true only in the plugin dir. From
