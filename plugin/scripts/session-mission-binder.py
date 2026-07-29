@@ -13,6 +13,16 @@
 # session_id after --resume) re-binds on their first status/wait call —
 # mission_status responses always carry a ?mission=<id> dashboard deep-link.
 #
+# CLAIM SEMANTICS — a mission has ONE supervising session, and status/wait cannot
+# steal it. mission_start / mission_resume are deliberate acts, so they always bind.
+# status/wait are not: any session in the repo may call mission_status just to look
+# (the SessionStart reminder used to tell every session to do exactly that), and
+# binding on it silently promoted a bystander into a locked-down supervisor — the repo
+# went read-only for a session that never asked to run the mission. So an
+# observational call binds a mission only when nobody else supervises it, or when
+# this session is a reopened conversation (marker written by session-start.sh on
+# source=="resume", the one case where a supervisor's own id has changed under it).
+#
 # Stdlib only, silent, never blocks a tool: any error → exit 0, no stdout.
 import json
 import os
@@ -29,6 +39,39 @@ BIND_TOOLS = re.compile(r"mission_(start|resume|status|wait)$")
 MISSION_ID = r"([a-z0-9-]{8,})"
 # Responses that mean "nothing actually started/resumed" — never bind on these.
 NOOP_MARKERS = ("Nothing to resume", "Unknown mission", "already started")
+# Verbs that only OBSERVE a mission — subject to the claim check above. start/resume declare
+# intent to run it, so they bind unconditionally.
+OBSERVATIONAL = ("status", "wait")
+
+
+def claimed_by_other(sessions_dir, session_id, mission_id):
+    """True iff a session OTHER than this one already records mission_id (or "*")."""
+    try:
+        entries = os.listdir(sessions_dir)
+    except OSError:
+        return False
+    mine = session_id + ".json"
+    for name in entries:
+        if not name.endswith(".json") or name == mine:
+            continue
+        try:
+            with open(os.path.join(sessions_dir, name)) as f:
+                other = json.load(f)
+        except Exception:
+            continue
+        recorded = other.get("missions") if isinstance(other, dict) else None
+        if isinstance(recorded, list) and (mission_id in recorded or "*" in recorded):
+            return True
+    return False
+
+
+def is_continuation(session_id):
+    """True iff session-start.sh marked this session a reopened conversation (source=="resume"),
+    whose fresh session_id no longer matches the binding its own earlier self wrote."""
+    marker = os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "medley-continuation-" + session_id
+    )
+    return os.path.exists(marker)
 
 
 def main():
@@ -96,6 +139,17 @@ def main():
             missions = [x for x in prev["missions"] if isinstance(x, str)]
     except Exception:
         pass  # missing/corrupt binding — start fresh
+    # Claim check: an observational call may not take a mission another session supervises.
+    # Already ours ⇒ nothing to claim (this is just a refresh). "*" only ever comes from a
+    # recovery resume, which is not observational.
+    if (
+        verb in OBSERVATIONAL
+        and mission_id not in missions
+        and claimed_by_other(sessions_dir, session_id, mission_id)
+        and not is_continuation(session_id)
+    ):
+        return
+
     if mission_id not in missions:
         missions.append(mission_id)
 

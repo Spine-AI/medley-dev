@@ -5,10 +5,30 @@
 # Workers inherit the plugin (settingSources) — the mission-agent reminder must never reach a
 # WORKER's context (it would misdirect it to orchestrate), and workers must not (re)install.
 [ "$MEDLEY_WORKER" = "1" ] && exit 0
-# Drain the hook payload (SessionStart / PreCompact deliver JSON on stdin). We don't need any field
-# from it — the same active-mission reminder is injected on both events — but consuming stdin avoids a
-# broken pipe on the delivering side.
-cat >/dev/null 2>&1 || true
+# Read the hook payload (SessionStart / PreCompact deliver JSON on stdin) — consuming stdin also
+# avoids a broken pipe on the delivering side. Two fields matter:
+#   session_id — forwarded to `status --brief` so the reminder can tell THIS session whether it is
+#     the mission's supervisor or a bystander (see host-session-bindings.ts). Without it every
+#     session in the repo was told "You are the mission agent. Check progress with mission_status",
+#     obeyed, and got bound as a supervisor by session-mission-binder.py — self-inflicted lockdown.
+#   source — "resume" means Claude Code reopened an existing conversation under a FRESH session_id,
+#     so a supervisor's binding no longer matches its own id. We drop a marker that lets it re-claim
+#     its mission (session-mission-binder.py reads it); a brand-new session ("startup") gets no
+#     marker and so can never claim a mission another session already supervises.
+MEDLEY_PAYLOAD="$(cat 2>/dev/null || true)"
+medley_json_string() {
+  printf '%s' "$MEDLEY_PAYLOAD" | tr -d '\n' |
+    sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+MEDLEY_SESSION_ID="$(medley_json_string session_id)"
+# Path-unsafe or absent ids are dropped, exactly like the binder refuses to write them.
+case "$MEDLEY_SESSION_ID" in
+  ''|*[!A-Za-z0-9._-]*) MEDLEY_SESSION_ID='' ;;
+esac
+if [ -n "$MEDLEY_SESSION_ID" ] && [ "$(medley_json_string source)" = "resume" ]; then
+  # Same marker dir the gate uses for its warn-once markers.
+  touch "${TMPDIR:-/tmp}/medley-continuation-${MEDLEY_SESSION_ID}" 2>/dev/null || true
+fi
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Which host is running this hook? Codex's hook command runner injects BOTH the bare `PLUGIN_ROOT`/
 # `PLUGIN_DATA` names AND the `CLAUDE_*` aliases (measured: they live in
@@ -172,16 +192,26 @@ fi
 # when a mission is actually live (no mission ⇒ nothing to supervise ⇒ no reason to nag), and the
 # reminder is exactly the "is a mission live" signal. Claude Code keeps the original exec: it has no
 # Stop hook to warn about, and exec'ing saves a subshell on the hot path.
+#
+# `--session-id` / `--continuation` are additive: an engine older than this plugin parses only
+# `--brief` and ignores the rest, falling back to the legacy repo-scoped reminder.
+MEDLEY_STATUS_ARGS=(status --brief)
+if [ -n "$MEDLEY_SESSION_ID" ]; then
+  MEDLEY_STATUS_ARGS+=(--session-id "$MEDLEY_SESSION_ID")
+  if [ -e "${TMPDIR:-/tmp}/medley-continuation-${MEDLEY_SESSION_ID}" ]; then
+    MEDLEY_STATUS_ARGS+=(--continuation)
+  fi
+fi
 if [ "$MEDLEY_HOST" != "codex" ]; then
   case "$ENGINE" in
-    *.cjs|*.js|*.mjs) exec node "$ENGINE" status --brief 2>/dev/null ;;
-    *)                exec "$ENGINE" status --brief 2>/dev/null ;;
+    *.cjs|*.js|*.mjs) exec node "$ENGINE" "${MEDLEY_STATUS_ARGS[@]}" 2>/dev/null ;;
+    *)                exec "$ENGINE" "${MEDLEY_STATUS_ARGS[@]}" 2>/dev/null ;;
   esac
 fi
 
 case "$ENGINE" in
-  *.cjs|*.js|*.mjs) MEDLEY_BRIEF="$(node "$ENGINE" status --brief 2>/dev/null || true)" ;;
-  *)                MEDLEY_BRIEF="$("$ENGINE" status --brief 2>/dev/null || true)" ;;
+  *.cjs|*.js|*.mjs) MEDLEY_BRIEF="$(node "$ENGINE" "${MEDLEY_STATUS_ARGS[@]}" 2>/dev/null || true)" ;;
+  *)                MEDLEY_BRIEF="$("$ENGINE" "${MEDLEY_STATUS_ARGS[@]}" 2>/dev/null || true)" ;;
 esac
 printf '%s' "$MEDLEY_BRIEF"
 

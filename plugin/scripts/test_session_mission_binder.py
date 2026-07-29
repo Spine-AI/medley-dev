@@ -333,5 +333,95 @@ class TestRobustness(BinderTestCase):
         self.assertEqual(self.read_binding()["missions"], [MID_A])
 
 
+class TestClaimSemantics(BinderTestCase):
+    """One supervisor per mission: mission_status / mission_wait must not hand a bystander
+    session the supervision (and with it the read-only repo) of a mission another session is
+    already running. start/resume are deliberate and always bind."""
+
+    OTHER = "other-session"
+
+    def setUp(self):
+        super().setUp()
+        # An isolated TMPDIR so no stray continuation marker from another test leaks in.
+        self._markers = tempfile.TemporaryDirectory()
+        self.addCleanup(self._markers.cleanup)
+        self.env = {"TMPDIR": self._markers.name}
+
+    def mark_continuation(self, session_id=None):
+        open(
+            os.path.join(
+                self._markers.name, f"medley-continuation-{session_id or self.SESSION}"
+            ),
+            "w",
+        ).close()
+
+    def status_of(self, mission_id):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Mission 'x' running — 2/5 tasks done.\n"
+                    f"Dashboard: http://localhost:8730/?mission={mission_id}",
+                }
+            ]
+        }
+
+    def observe(self, mission_id, tool="mission_status"):
+        self.bind(tool, tool_input={}, tool_response=self.status_of(mission_id), env_extra=self.env)
+
+    def test_status_does_not_claim_another_sessions_mission(self):
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.observe(MID_A)
+        self.assertIsNone(
+            self.read_binding(), "a bystander's status call must not bind (no self-lockdown)"
+        )
+        self.assertEqual(self.read_binding(self.OTHER)["missions"], [MID_A])
+
+    def test_wait_does_not_claim_another_sessions_mission(self):
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.observe(MID_A, tool="mission_wait")
+        self.assertIsNone(self.read_binding())
+
+    def test_wildcard_claim_blocks_observational_binding(self):
+        self.write_binding(["*"], session_id=self.OTHER)
+        self.observe(MID_A)
+        self.assertIsNone(self.read_binding())
+
+    def test_status_claims_an_unclaimed_mission(self):
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+    def test_status_claims_when_another_session_holds_a_different_mission(self):
+        self.write_binding([MID_B], session_id=self.OTHER)
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+    def test_status_refreshes_our_own_existing_claim(self):
+        self.write_binding([MID_A])
+        self.write_binding([MID_A], session_id=self.OTHER)  # a stale/duplicate holder
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+        self.assertGreater(self.read_binding()["updatedAt"], 1)
+
+    def test_start_and_resume_still_bind_over_another_claim(self):
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.bind(
+            "mission_start",
+            tool_input={"missionId": MID_A},
+            tool_response={"content": [{"type": "text", "text": "Mission started."}]},
+            env_extra=self.env,
+        )
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+    def test_continuation_marker_lets_a_reopened_session_reclaim(self):
+        # `claude --resume` reopens the supervisor's conversation under a FRESH session id, so
+        # its own earlier binding is under the OLD id. session-start.sh marks it; the claim
+        # check then yields to it rather than telling the real supervisor to stand down.
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.mark_continuation()
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+
 if __name__ == "__main__":
     unittest.main()
