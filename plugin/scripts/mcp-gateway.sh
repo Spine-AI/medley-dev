@@ -61,7 +61,7 @@ done
 # older binary ignores `--gateway` and serves the ORCHESTRATOR under the gateway's name, the exact
 # failure this script exists to prevent. Baseline behavior for an unpinned plugin dir is to REFUSE, and
 # it must stay that way. Both sides are resolved through `cd && pwd` so a symlinked $HOME still matches.
-FIXED_DIR="$(cd "$MEDLEY_HOME/bin" 2>/dev/null && pwd || true)"
+FIXED_DIR="$(cd "$MEDLEY_HOME/bin" 2>/dev/null && pwd)"  # empty when absent; no `set -e` here
 IS_FIXED_PATH=""
 if [ -n "$FIXED_DIR" ] && [ "$DIR" = "$FIXED_DIR" ]; then IS_FIXED_PATH=1; fi
 # ── FIXED-PATH FALLBACKS ────────────────────────────────────────────────────────────────────────────

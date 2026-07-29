@@ -157,8 +157,11 @@ reference in a shipped file — always go through the resolver.
   `MEDLEY_ENGINE=/path/to/medley-engine/dist/medley-engine.cjs claude --plugin-dir ./plugin`.
 - **Installed mode** (what users get): `/plugin marketplace add <local path or Spine-AI/medley>` →
   `/plugin install medley` → new session downloads the engine binary into `${CLAUDE_PLUGIN_DATA}/bin`.
-- **Validate** before pushing: `claude plugin validate ./plugin --strict`. Shellcheck the
-  `scripts/*.sh`.
+- **Validate** before pushing: `claude plugin validate ./plugin --strict`, the
+  `plugin/scripts/test_*.sh` / `test_*.py` suites, and **`shellcheck -S info plugin/scripts/*.sh`**.
+  Use that exact severity flag: CI runs a bare `shellcheck plugin/scripts/*.sh`, and apt's build
+  reports **info**-level findings while brew's default threshold hides them — so a bare local run went
+  green on an `SC2015` (`A && B || C`) that failed CI. Prefer `if/then` over `A && B || C` regardless.
 
 ### Under Codex CLI (0.145+)
 
