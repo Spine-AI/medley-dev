@@ -16,15 +16,20 @@ Design + rationale: `docs/superpowers/specs/2026-07-28-medley-dev-channel-design
   orchestrator into its own workers. Only the *marketplace* is named `medley-dev`. The Codex
   manifest keeps the same `name`, and the two manifests must not drift on `name` or base `version`.
 - **Never commit engine source or the built bundle here.** Same rule as stable.
-- **Only five files may differ from stable FOR CHANNEL REASONS:** `.claude-plugin/marketplace.json`,
-  `plugin/.claude-plugin/plugin.json`, `plugin/engine/version`, `README.md`, `CLAUDE.md`.
-  Check with: `diff -r --exclude=.git ../medley . | grep -v '^Only in'`
-  **Codex-host support is a second, standing exception while it is being built here first**
-  (`docs/codex/PHASES.md`). It has outgrown a short list, so the rule is now: *everything else must
-  stay byte-identical, and the Codex set below is expected to flag.* Nothing outside these two
-  groups may diverge.
+- **CODEX-HOST SUPPORT GRADUATED TO STABLE on 2026-07-29** (stable `medley` commit `ebe0738`, engine
+  v0.8.9). The standing exception below is retired: every Codex file listed in it now exists in
+  `Spine-AI/medley` too, so this repo is back to differing from stable for **channel reasons only** —
+  `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json`,
+  `plugin/.claude-plugin/plugin.json`, `plugin/.codex-plugin/plugin.json`, `plugin/engine/version`,
+  `README.md`, `CLAUDE.md`, plus the `medley-dev` marketplace name baked into `uninstall.sh`'s
+  `MARKET`, `scripts/codex-dev-install.sh`'s `MARKETPLACE`, and the test fixtures that mirror them.
+  Check with: `diff -r --exclude=.git ../medley . | grep -v '^Only in'` — anything outside that set is
+  drift, and NEW work still starts here and folds back on the next graduation.
+- **The pin may sit BEHIND stable between dev cuts.** `plugin/engine/version` is `0.8.8-dev.3` while
+  stable is on `0.8.9` — those two builds are code-identical (0.8.9 graduated dev.3), so re-pinning
+  would only cost dev users an 87MB no-op download. Bump it on the next real prerelease.
 
-  Codex-only files (new here, absent from stable):
+  Codex-only files (graduated — kept in sync with stable, no longer this repo's alone):
   - `plugin/.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json`
   - `plugin/scripts/medley-mcp.sh` — fixed-path MCP launcher (no plugin env on that host)
   - `plugin/scripts/mission-watch-gate.py` + `test_mission_watch_gate.py` — the Codex supervision
