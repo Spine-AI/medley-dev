@@ -80,6 +80,44 @@ if [ -f "$DIR/medley-mcp.sh" ]; then
     mv -f "$_mcp_tmp" "${HOME}/.medley/bin/medley-mcp" 2>/dev/null || rm -f "$_mcp_tmp" 2>/dev/null || true
   fi
 fi
+# Same stable-copy trick for the GATEWAY launcher (connected apps) — and note it is the SAME script as
+# the plugin's own `medley_gateway` entry runs, installed at a second path rather than forked. That
+# works because mcp-gateway.sh resolves its pin from `$DIR/..`: from the plugin dir that is the plugin
+# root and it reads the manifest pin (Claude Code), while from ~/.medley/bin there is no engine/version
+# and it falls through to the fixed-path breadcrumbs written below (Codex). One file, ONE pin-strict
+# rule, two hosts — the gateway must never be routed through medley-mcp, which tracks the newest
+# installed engine instead of the pin (an older binary ignores `--gateway` and would serve the
+# ORCHESTRATOR under the gateway's name). Installed from either host for the same reason as medley-mcp
+# above: one writer, and the copy is inert until a manifest actually launches it.
+if [ -f "$DIR/mcp-gateway.sh" ]; then
+  mkdir -p "${HOME}/.medley/bin" 2>/dev/null || true
+  _gw_tmp="${HOME}/.medley/bin/medley-gateway.tmp.$$"
+  if cp "$DIR/mcp-gateway.sh" "$_gw_tmp" 2>/dev/null; then
+    chmod +x "$_gw_tmp" 2>/dev/null || true
+    mv -f "$_gw_tmp" "${HOME}/.medley/bin/medley-gateway" 2>/dev/null || rm -f "$_gw_tmp" 2>/dev/null || true
+  fi
+fi
+# CODEX ONLY: leave the two values that launcher needs at fixed paths, since a Codex MCP server gets
+# neither the plugin env nor manifest interpolation. The engine PIN (a value, not a plugin root — see
+# mcp-gateway.sh for why that distinction is load-bearing) and the data dir holding the downloaded
+# binaries (~/.codex/plugins/data/<plugin>-<marketplace>, which is NOT versioned, so it is safe to
+# store as a path). Claude Code deliberately does NOT write these: its data dir belongs to a possibly
+# different CHANNEL's plugin, and resolving the Codex gateway's pin against that cache would either
+# miss or hand it the wrong build. Atomic (tmp + mv), best-effort; a stale value fails closed in the
+# launcher and is rewritten here on the next session start.
+if [ "$MEDLEY_HOST" = "codex" ] && [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  medley_write_crumb() { # $1 = file name under ~/.medley, $2 = value (skipped when empty)
+    [ -n "$2" ] || return 0
+    _cr_tmp="${HOME}/.medley/$1.tmp.$$"
+    if printf '%s\n' "$2" > "$_cr_tmp" 2>/dev/null; then
+      mv -f "$_cr_tmp" "${HOME}/.medley/$1" 2>/dev/null || rm -f "$_cr_tmp" 2>/dev/null || true
+    fi
+  }
+  if [ -f "$DIR/../engine/version" ]; then
+    medley_write_crumb codex-engine-pin "$(tr -d ' \t\n\r' < "$DIR/../engine/version" 2>/dev/null)"
+  fi
+  medley_write_crumb codex-plugin-data "${CLAUDE_PLUGIN_DATA}"
+fi
 # Pre-warm the shared daemon out-of-band so it's already up (or already warming) by the time the MCP
 # server (.mcp.json → run-engine.sh mcp) attaches. Otherwise a cold session pays the daemon boot +
 # health poll INSIDE Claude Code's MCP init window and tools can fail to register on session 1.

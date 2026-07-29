@@ -27,6 +27,13 @@
         "-c",
         "exec \"$HOME/.medley/bin/medley-mcp\" mcp --host codex"
       ]
+    },
+    "medley_gateway": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "exec \"$HOME/.medley/bin/medley-gateway\""
+      ]
     }
   },
   "interface": {

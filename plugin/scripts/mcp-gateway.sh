@@ -24,12 +24,23 @@
 set -u
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEDLEY_HOME="${HOME:-/nonexistent}/.medley"
 
 # CC interpolates ${CLAUDE_PLUGIN_DATA} into a stdio server's args, so .mcp.json passes it as $1 (the
 # same contract mcp-headers.sh uses). Measured: it also lands in the server's env — but $1 stays the
 # primary, since arg interpolation is the documented behavior and the env var is not guaranteed across
 # install modes. ensure-engine.sh hard-requires this value.
+#
+# ON A HOST WITH NO PLUGIN ENV (Codex) neither is available: the manifest does not interpolate
+# ${VAR} and the MCP server process inherits a bare env (measured — see medley-mcp.sh). This same
+# script is therefore ALSO installed at ~/.medley/bin/medley-gateway by session-start.sh, and the
+# hook — which DOES get the plugin env — leaves both halves of the resolution at fixed paths for us
+# to read here. That is the whole reason the gateway can keep its pin-strict rule on that host
+# instead of being routed through medley-mcp.sh, which only tracks the newest installed engine.
 DATADIR="${1:-${CLAUDE_PLUGIN_DATA:-}}"
+if [ -z "$DATADIR" ]; then
+  DATADIR="$(cat "$MEDLEY_HOME/codex-plugin-data" 2>/dev/null || true)"
+fi
 
 # The pin is read from OUR OWN location first, not from $CLAUDE_PLUGIN_ROOT. Measured: CC DOES set
 # that env var for a stdio MCP server (verified via --plugin-dir), so reading it would work — but the
@@ -45,13 +56,39 @@ for root in "$PLUGIN_ROOT" "${CLAUDE_PLUGIN_ROOT:-}"; do
     if [ -n "$VERSION" ]; then break; fi
   fi
 done
+# Fixed-path fallback for the no-plugin-env host: when this file runs from ~/.medley/bin, `..` is
+# ~/.medley and holds no engine/version, so we land here. The breadcrumb carries the PIN VALUE and
+# deliberately NOT a plugin root: a root would point into the VERSIONED Codex plugin cache
+# (…/cache/<market>/medley/<ver>/), which Codex renames and prunes whenever the source manifest's
+# version changes — precisely the dangling-path failure that made session-start.sh exit 127 and
+# turned a missing edit-conflict-gate.py into a "PreToolUse denied". A pin is just a string: it can
+# go STALE but never dangle, and stale fails closed (the binary for that version isn't there, so we
+# refuse below) rather than executing something unexpected. SessionStart rewrites it at thread start,
+# before any tool call can reach the gateway.
+if [ -z "$VERSION" ]; then
+  VERSION="$(tr -d ' \t\n\r' < "$MEDLEY_HOME/codex-engine-pin" 2>/dev/null || true)"
+fi
+
+# The local-build pin used by scripts/codex-dev-install.sh. Honored here for the same reason
+# medley-mcp.sh honors it: on Codex there is no way to pass $MEDLEY_ENGINE to an MCP server, so a
+# developer testing a local engine would otherwise get a local-build mission proxy and a
+# downloaded-binary gateway in the same session. Both entries are explicit developer overrides and
+# rank above the pin — a dev who points these at an old build owns that choice.
+OVERRIDE="$(cat "$MEDLEY_HOME/engine-override" 2>/dev/null || true)"
 
 ENGINE=""
 if [ -n "${MEDLEY_ENGINE:-}" ] && [ -f "${MEDLEY_ENGINE}" ]; then
   ENGINE="${MEDLEY_ENGINE}" # explicit dev override (a local .cjs or binary)
+elif [ -n "$OVERRIDE" ] && [ -f "$OVERRIDE" ]; then
+  ENGINE="$OVERRIDE"        # ~/.medley/engine-override — the Codex dev loop's local-build pin
 elif [ -n "$VERSION" ] && [ -n "$DATADIR" ]; then
   ENGINE="${DATADIR}/bin/medley-engine-${VERSION}"
-  if [ ! -f "$ENGINE" ]; then
+  # The rescue below needs ensure-engine.sh NEXT TO US, which is true only in the plugin dir. From
+  # ~/.medley/bin there is nothing to call (and nothing to call it with — no plugin root to read a
+  # pin from), so we skip straight to the refusal, which the Codex path recovers from on the next
+  # SessionStart. Guarded rather than unconditional so a missing file can't print a `command not
+  # found` line into a channel a host may be parsing.
+  if [ ! -f "$ENGINE" ] && [ -x "$DIR/ensure-engine.sh" ]; then
     # Not downloaded yet (a fresh install, or this connect beat the SessionStart bootstrap). Fetch it
     # now — ensure-engine.sh is idempotent and single-flight-locked, so a concurrent SessionStart
     # download is safe and we simply wait for it. stdout redirected: it must not pollute JSON-RPC.
@@ -63,8 +100,9 @@ elif [ -n "$VERSION" ] && [ -n "$DATADIR" ]; then
 fi
 
 if [ -z "$ENGINE" ] || [ ! -f "$ENGINE" ]; then
-  echo "medley: the gateway needs engine v${VERSION:-?}, which isn't available yet (download pending or" >&2
-  echo "        offline). Your mission tools are unaffected; connected apps return on the next session." >&2
+  echo "medley: the gateway needs engine v${VERSION:-?}, which isn't available yet (download pending," >&2
+  echo "        offline, or this host's SessionStart hook has not run yet). Your mission tools are" >&2
+  echo "        unaffected; connected apps return on the next session." >&2
   exit 1
 fi
 

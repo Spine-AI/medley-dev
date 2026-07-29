@@ -73,4 +73,45 @@ out="$(run '{"hook_event_name":"SessionStart","cwd":"'"$tmp"'"}')"
 assert_contains "$out" "ENGINE_ARGS:status --brief" "no session id still briefs"
 assert_missing "$out" "--session-id" "absent session id dropped"
 
+# 8. The two fixed-path launchers are installed from EITHER host (one writer; inert until a manifest
+#    launches them). These exist because a Codex MCP server gets no plugin env at all.
+run '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"'"$tmp"'"}' >/dev/null
+for shim in medley-mcp medley-gateway; do
+  if [ ! -x "$tmp/.medley/bin/$shim" ]; then echo "FAIL [installs $shim]"; fail=1; fi
+done
+# The gateway shim is the SAME file as the plugin's own mcp-gateway.sh, not a fork.
+if ! cmp -s "$DIR/mcp-gateway.sh" "$tmp/.medley/bin/medley-gateway"; then
+  echo "FAIL [medley-gateway is a verbatim copy of mcp-gateway.sh]"; fail=1
+fi
+
+# 9. Claude Code must NOT write the Codex breadcrumbs: its plugin data dir may belong to a different
+#    CHANNEL's plugin, and resolving the Codex gateway's pin against that cache would hand it the
+#    wrong build (or miss entirely).
+for crumb in codex-engine-pin codex-plugin-data; do
+  if [ -e "$tmp/.medley/$crumb" ]; then echo "FAIL [claude-code writes no $crumb]"; fail=1; fi
+done
+
+# 10. Under Codex (detected from a data dir under ~/.codex/) both breadcrumbs are written, so
+#     mcp-gateway.sh can keep its pin-strict resolution on a host with no plugin env.
+CODEX_DATA="$tmp/.codex/plugins/data/medley-medley-dev"
+mkdir -p "$CODEX_DATA"
+out="$(printf '%s' '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"'"$tmp"'"}' \
+  | HOME="$tmp" TMPDIR="$tmp" MEDLEY_DATA_DIR="$tmp" MEDLEY_ENGINE="$FAKE" MEDLEY_DAEMON=0 MEDLEY_WORKER="" \
+    CLAUDE_PLUGIN_DATA="$CODEX_DATA" bash "$SS" 2>/dev/null)"
+assert_contains "$out" "ENGINE_ARGS:status --brief" "codex still briefs"
+expected_pin="$(tr -d ' \t\n\r' < "$DIR/../engine/version")"
+got_pin="$(tr -d ' \t\n\r' < "$tmp/.medley/codex-engine-pin" 2>/dev/null)"
+[ "$got_pin" = "$expected_pin" ] || { echo "FAIL [codex pin crumb]: got '$got_pin' want '$expected_pin'"; fail=1; }
+got_data="$(tr -d ' \t\n\r' < "$tmp/.medley/codex-plugin-data" 2>/dev/null)"
+[ "$got_data" = "$CODEX_DATA" ] || { echo "FAIL [codex data crumb]: got '$got_data' want '$CODEX_DATA'"; fail=1; }
+
+# 11. A WORKER exits before any of this — it must neither install a launcher nor stamp a breadcrumb
+#     (it was spawned BY a live engine and must not influence which engine the gateway resolves).
+rm -rf "$tmp/.medley/bin" "$tmp/.medley/codex-engine-pin" "$tmp/.medley/codex-plugin-data"
+printf '%s' '{"hook_event_name":"SessionStart"}' | HOME="$tmp" MEDLEY_DATA_DIR="$tmp" MEDLEY_ENGINE="$FAKE" \
+  MEDLEY_DAEMON=0 MEDLEY_WORKER=1 CLAUDE_PLUGIN_DATA="$CODEX_DATA" bash "$SS" >/dev/null 2>&1
+for p in bin/medley-gateway codex-engine-pin codex-plugin-data; do
+  if [ -e "$tmp/.medley/$p" ]; then echo "FAIL [worker writes no $p]"; fail=1; fi
+done
+
 if [ "$fail" = 0 ]; then echo "ok: session-start hook → status --brief mapping"; else exit 1; fi

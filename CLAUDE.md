@@ -31,7 +31,19 @@ Design + rationale: `docs/superpowers/specs/2026-07-28-medley-dev-channel-design
 
   Codex-only files (graduated — kept in sync with stable, no longer this repo's alone):
   - `plugin/.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json`
-  - `plugin/scripts/medley-mcp.sh` — fixed-path MCP launcher (no plugin env on that host)
+  - `plugin/scripts/medley-mcp.sh` — fixed-path MISSION launcher (no plugin env on that host).
+    Resolution is deliberately version-TOLERANT (`~/.medley/engine-path` = newest installed), which is
+    exactly why the gateway is not routed through it — see below.
+  - `plugin/scripts/mcp-gateway.sh` + `test_mcp_gateway.sh` — one file, TWO install locations. From
+    `<plugin>/scripts/` it reads the manifest pin (Claude Code); `session-start.sh` also installs it as
+    `~/.medley/bin/medley-gateway`, where `$DIR/..` holds no `engine/version` so it falls through to the
+    fixed-path breadcrumbs `~/.medley/codex-engine-pin` + `codex-plugin-data` (Codex). That keeps ONE
+    pin-STRICT rule on both hosts, which is the whole point: an older binary silently ignores
+    `mcp --gateway` and serves the ORCHESTRATOR under the gateway's name — duplicate mission tools.
+    The breadcrumb holds the **pin value, never a plugin root**: a root points into the VERSIONED Codex
+    cache that Codex renames + prunes, i.e. the same dangling-path bug that made `session-start.sh`
+    exit 127. A stale pin can only fail closed. Claude Code must never write these breadcrumbs — its
+    data dir may belong to a different CHANNEL's plugin.
   - `plugin/scripts/mission-watch-gate.py` + `test_mission_watch_gate.py` — the Codex supervision
     **backstop**. Codex has no wake-on-exit, so its agent supervises by LOOPING `mission_wait` inside
     one long turn (viable only because Codex, unlike Claude Code, accepts user input mid-turn). This
@@ -54,8 +66,9 @@ Design + rationale: `docs/superpowers/specs/2026-07-28-medley-dev-channel-design
     `SPAWN_TOOLS`. (The `Bash` branch needed **no** change: Codex aliases its shell tool to
     `tool_name: "Bash"` with the command in `tool_input["command"]`, so the read-only allowlist
     already applied there.)
-  - `plugin/scripts/session-start.sh` — the `medley-mcp` launcher install AND the host gate that
-    skips the Claude-only `~/.claude/settings.json` statusline autowire
+  - `plugin/scripts/session-start.sh` — the `medley-mcp` + `medley-gateway` launcher installs, the
+    Codex-gated gateway breadcrumbs, AND the host gate that skips the Claude-only
+    `~/.claude/settings.json` statusline autowire
   - `plugin/scripts/uninstall.sh` — dual-host teardown; also fixes this repo's own Claude paths,
     which were inherited from stable and pointed at the *stable* channel's dirs
   - `plugin/scripts/test_statusline_autowire.sh` — Codex host-gate cases
@@ -206,6 +219,8 @@ plugin/hooks/hooks.json           SessionStart/PreCompact → session-start.sh; 
 plugin/scripts/                   {resolve,ensure,run}-engine.sh, session-start.sh, statusline.sh,
                                   edit-conflict-gate.py, medley-mcp.sh (installed to the fixed path
                                   ~/.medley/bin/medley-mcp for hosts with no plugin env — Codex),
+                                  mcp-gateway.sh (the gateway launcher; ALSO installed to the fixed
+                                  path ~/.medley/bin/medley-gateway, pin-strict via breadcrumbs),
                                   mission-watch-gate.py (Codex Stop-hook watcher),
                                   strip-codex-config.py (uninstall: ~/.codex/config.toml tables)
 plugin/engine/version             engine version pin (release-managed)

@@ -119,15 +119,29 @@ Goal: `/mission` runs end to end under `codex`, using today's routing.
   - [x] **no `hooks` key**; **no `apps` key** unless a `.app.json` actually exists
   - [x] inline `mcpServers` — per V7, via the fixed-path launcher, NOT `$PLUGIN_ROOT`:
         - `medley` → `bash -c 'exec "$HOME/.medley/bin/medley-mcp" mcp'`
-        - `medley_gateway` → **deliberately omitted for now.** `mcp --gateway` is pin-STRICT by
-          design (`mcp-gateway.sh` refuses to fall back to `~/.medley/engine-path`, because an
+        - `medley_gateway` → **DONE (2026-07-30).** Was omitted because `mcp --gateway` is pin-STRICT
+          by design (`mcp-gateway.sh` refuses to fall back to `~/.medley/engine-path`, because an
           older binary silently ignores the flag and serves the ORCHESTRATOR under the gateway's
-          name — duplicate mission tools, the worst failure mode for a first Codex run). The
-          launcher has only `engine-path` to go on, so it cannot honour that guard.
-          **Now cheap to fix, given V3:** the hook has both `CLAUDE_PLUGIN_ROOT` and a real
-          `CLAUDE_PLUGIN_DATA`, so it can drop them at fixed paths (`~/.medley/codex-plugin-root`,
-          `~/.medley/codex-plugin-data`) for a gateway shim to read — restoring full pin-strict
-          resolution. Do that when connected apps are in scope.
+          name — duplicate mission tools, the worst failure mode for a first Codex run), and
+          `medley-mcp` has only `engine-path` to go on.
+          **Fix shipped, and it needed no second launcher:** `session-start.sh` installs
+          `mcp-gateway.sh` ITSELF at `~/.medley/bin/medley-gateway`. That file resolves its pin from
+          `$DIR/..`, which is the plugin root in the plugin dir and `~/.medley` at the fixed path —
+          so the fixed-path copy naturally falls through to two Codex-gated breadcrumbs the hook
+          writes. One file, one pin-strict rule, two hosts.
+          **Deviation from the plan above:** the breadcrumb is `codex-engine-pin` (the pin VALUE),
+          **not** `codex-plugin-root`. A root points into the versioned Codex cache that Codex renames
+          and prunes — the exact dangling-path failure that produced the 127 / exit-2 pair in the item
+          below. A pin can go stale but never dangle, and stale fails closed. `codex-plugin-data` is
+          kept as a path because the Codex data dir is NOT versioned.
+          Verified: bare-env handshake (the measured Codex env, byte for byte) through
+          `~/.medley/bin/medley-gateway` returns **23 tools** — `auth_status`, `reauth`, `add_app` +
+          the connected app's tools — with **zero** overlap against the mission proxy's 21, i.e. the
+          duplicate-orchestrator failure mode is provably absent. No engine change was required.
+          Still owed: `--host codex` is NOT passed in gateway mode (it is inert today — the `/mcp`
+          gateway branch never reads `X-Medley-Host`, and `sessionStarted` telemetry is skipped for
+          `isWorker`). Pass it if gateway/app-usage attribution by host is ever wanted; that needs an
+          engine change to read it.
   - [x] apply whatever V1 concluded about the root `.mcp.json` — inline object form, so Codex
         ignores the http+`headersHelper` entry entirely (confirmed: it sits in the installed cache
         copy and is not registered)
