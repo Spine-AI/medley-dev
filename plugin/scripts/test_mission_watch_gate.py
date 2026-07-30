@@ -204,11 +204,20 @@ class TestClaudeCodeComposerRung(WatchGateCase):
         super().setUp()
         self.write_binding("s1", ["m1"])
 
-    def owed(self, count, status="running"):
-        self.write_state(
-            status=status,
-            missions=[{"id": "m1", "title": "Ship the widget", "status": status, "pendingMessages": count}],
-        )
+    def owed(self, count, status="running", pid=1, mission_id="m1"):
+        """The composer outbox breadcrumb. Note it is written INDEPENDENTLY of mission-state.json —
+        `status` here only controls the lockdown file, and the rung must fire regardless of it."""
+        self.write_state(status=status)
+        path = os.path.join(self.repo, ".medley", "composer-outbox.json")
+        if count == 0:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        with open(path, "w") as fh:
+            json.dump(
+                {"updatedAt": 1, "pid": pid, "owed": [{"missionId": mission_id, "title": "Ship the widget", "count": count}]},
+                fh,
+            )
 
     def test_blocks_when_a_message_is_owed(self):
         self.owed(1)
@@ -233,9 +242,10 @@ class TestClaudeCodeComposerRung(WatchGateCase):
         self.owed(0)
         self.assertPassesThrough(host="claude")
 
-    def test_silent_when_engine_predates_the_field(self):
-        # An older engine writes no pendingMessages. Absent must read as zero, not as "unknown → nag".
-        self.write_state(missions=[{"id": "m1", "title": "Ship the widget", "status": "running"}])
+    def test_silent_when_engine_predates_the_breadcrumb(self):
+        # An older engine writes no composer-outbox.json at all. Absent must read as "nothing owed",
+        # not as "unknown → nag".
+        self.write_state()
         self.assertPassesThrough(host="claude")
 
     def test_silent_when_this_session_does_not_supervise(self):
@@ -244,9 +254,37 @@ class TestClaudeCodeComposerRung(WatchGateCase):
         self.owed(2)
         self.assertPassesThrough(host="claude", session_id="some-other-session")
 
-    def test_silent_when_the_mission_is_not_live(self):
-        self.owed(2, status="paused")
+    def test_silent_when_the_breadcrumb_writer_is_dead(self):
+        # A SIGKILLed daemon leaves the file behind; treating it as authoritative would nag the agent
+        # on every stop forever. Same liveness contract as mission-state.json.
+        self.owed(1, pid=999999)
         self.assertPassesThrough(host="claude")
+
+    # ── the case this rung exists for ─────────────────────────────────────────────────────────
+    def test_FIRES_after_the_mission_has_finished(self):
+        # The bug this fixes: the rung used to require a live mission, so it went silent at exactly
+        # the moment the user keeps talking — after the work is done. The breadcrumb is independent of
+        # mission status, and nothing here may reintroduce a liveness gate.
+        self.owed(1, status="completed")
+        code, decision, reason = self.run_hook(host="claude")
+        self.assertEqual((code, decision), (0, "block"))
+        self.assertIn("Ship the widget", reason)
+        # And it must tell the agent to KEEP listening, not just deliver once.
+        self.assertIn("re-arming", reason.lower())
+
+    def test_fires_on_a_paused_mission_too(self):
+        self.owed(2, status="paused")
+        _, decision, _ = self.run_hook(host="claude")
+        self.assertEqual(decision, "block")
+
+    def test_fires_when_no_lockdown_file_exists_at_all(self):
+        # Once every mission settles the engine DELETES mission-state.json. The breadcrumb has its own
+        # lifetime precisely so the rung survives that — this is the real post-mission shape on disk,
+        # and it is what would have broken if the owed set were read from the lockdown file.
+        self.owed(1, status="completed")
+        os.remove(os.path.join(self.repo, ".medley", "mission-state.json"))
+        _, decision, _ = self.run_hook(host="claude")
+        self.assertEqual(decision, "block")
 
     def test_silent_under_the_loop_guard(self):
         # One nudge per turn, so an agent that genuinely cannot continue is never trapped.

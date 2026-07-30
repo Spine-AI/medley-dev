@@ -117,30 +117,80 @@ def supervises(repo: str, session_id, missions) -> bool:
     return any(m["id"] in recorded for m in missions)
 
 
+def owed_messages(repo: str):
+    """Composer messages this repo's missions still owe the host session, from
+    `.medley/composer-outbox.json`. [] when absent/stale/unparseable.
+
+    A SEPARATE file from mission-state.json on purpose: that one is deleted the moment no mission
+    governs the repo, and the case this exists for is "the mission finished and the user is still
+    talking to the agent" — so reading it from there would go blind exactly when it matters.
+
+    Same daemon-liveness probe as live_missions: a dead writer's file is stale, not authoritative, so
+    a SIGKILLed daemon can never leave an agent being nagged forever.
+    """
+    try:
+        with open(os.path.join(repo, ".medley", "composer-outbox.json")) as fh:
+            state = json.load(fh)
+    except Exception:
+        return []
+    if not isinstance(state, dict):
+        return []
+    pid = state.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # alive, owned by someone else
+        except Exception:
+            return []  # dead writer → stale file
+    owed = state.get("owed")
+    if not isinstance(owed, list):
+        return []
+    return [
+        o
+        for o in owed
+        if isinstance(o, dict)
+        and isinstance(o.get("missionId"), str)
+        and isinstance(o.get("count"), int)
+        and o["count"] > 0
+    ]
+
+
+def supervises_any(repo: str, session_id, mission_ids) -> bool:
+    """True iff this session's binding claims one of `mission_ids` (or holds the "*" wildcard).
+
+    Mirrors `supervises`, but keyed on ids rather than mission dicts — the outbox breadcrumb carries
+    ids only, and unlike the lockdown list it includes missions that have already finished.
+    """
+    return supervises(repo, session_id, [{"id": mid} for mid in mission_ids])
+
+
 def nudge_claude_code(repo: str, session_id) -> int:
-    """Claude Code only: block the stop iff a supervised live mission owes the user a reply.
+    """Claude Code only: block the stop iff this session owes the user a reply they typed into the
+    dashboard's mission chat.
 
     Returns 0 either way (a Stop hook communicates by what it PRINTS, not by exit code). Silent
-    unless every condition holds, because blocking a turn the user wanted to end is worse than a
+    unless both conditions hold, because blocking a turn the user wanted to end is worse than a
     late-delivered message:
 
-      * a live mission in this repo, which THIS session is confirmed to supervise (same strict
-        binding check the Codex path uses — never hijack a session merely sharing the repo), and
-      * `pendingMessages > 0` on that mission, written by the engine.
+      * something is owed for a mission in this repo, per the engine's outbox breadcrumb, and
+      * THIS session is confirmed to supervise that mission (same strict binding check the Codex
+        path uses — never hijack a session merely sharing the repo).
 
-    `pendingMessages` absent (an older engine than this plugin) reads as 0, so the hook stays silent
-    rather than nagging on every stop — the same fail-quiet direction as the rest of this file.
+    Deliberately NOT gated on the mission being live. That was the bug: the user's own case is
+    continuing the thread after the work is done, and requiring a live mission made the hook go quiet
+    at exactly that moment. Nothing here depends on mission status.
+
+    No breadcrumb (an engine older than this plugin, or nothing owed) means silence — the same
+    fail-quiet direction as the rest of this file.
     """
-    missions = live_missions(repo)
-    if not missions:
-        return 0
-    if not supervises(repo, session_id, missions):
-        return 0
-    owed = [m for m in missions if isinstance(m.get("pendingMessages"), int) and m["pendingMessages"] > 0]
+    owed = owed_messages(repo)
     if not owed:
         return 0
-    mission = owed[0]
-    count = mission["pendingMessages"]
+    if not supervises_any(repo, session_id, [o["missionId"] for o in owed]):
+        return 0
+    total = sum(o["count"] for o in owed)
+    title = owed[0].get("title") or "the mission"
     print(
         json.dumps(
             {
@@ -150,9 +200,11 @@ def nudge_claude_code(repo: str, session_id) -> int:
                     "waiting on you — you have not seen the text yet, and it is not in this transcript. "
                     "Arm the progress watcher as a BACKGROUND Bash task (run_in_background: true) the "
                     "same way mission_start told you to; it will hand you what they said as soon as it "
-                    "wakes you, then answer them directly. If you believe a watcher is already armed, "
-                    "say so in one line and end your turn — it will deliver."
-                    % (count, "" if count == 1 else "s", mission.get("title") or "the mission")
+                    "wakes you, then answer them directly. Keep re-arming it afterwards so they can "
+                    "keep talking to you here — that watcher is the only way the dashboard can reach "
+                    "you. If one is already armed, say so in one line and end your turn; it will "
+                    "deliver."
+                    % (total, "" if total == 1 else "s", title)
                 ),
             }
         )
