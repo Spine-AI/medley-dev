@@ -193,5 +193,79 @@ class TestStaysOutOfTheWay(WatchGateCase):
         self.assertEqual(decision, "block")
 
 
+class TestClaudeCodeComposerRung(WatchGateCase):
+    """The ONE thing this hook does on Claude Code: stop an agent from going idle while the user is
+    waiting on an answer they typed into the dashboard composer.
+
+    Everything else on that host stays the background watcher's job — so every test here that is not
+    the happy path asserts SILENCE, and the Codex path is asserted untouched."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_binding("s1", ["m1"])
+
+    def owed(self, count, status="running"):
+        self.write_state(
+            status=status,
+            missions=[{"id": "m1", "title": "Ship the widget", "status": status, "pendingMessages": count}],
+        )
+
+    def test_blocks_when_a_message_is_owed(self):
+        self.owed(1)
+        code, decision, reason = self.run_hook(host="claude")
+        self.assertEqual((code, decision), (0, "block"))
+        self.assertIn("Ship the widget", reason)
+        # It must send the agent to the channel that can actually deliver — and must NOT pretend to
+        # carry the text, since it cannot mark a message delivered.
+        self.assertIn("background", reason.lower())
+        self.assertIn("watcher", reason.lower())
+
+    def test_pluralizes_honestly(self):
+        self.owed(3)
+        _, _, reason = self.run_hook(host="claude")
+        self.assertIn("3 messages", reason)
+        self.owed(1)
+        _, _, reason = self.run_hook(host="claude")
+        self.assertIn("1 message from", reason)
+
+    def test_silent_when_nothing_is_owed(self):
+        # The pre-existing guarantee: with no message waiting, Claude Code is untouched.
+        self.owed(0)
+        self.assertPassesThrough(host="claude")
+
+    def test_silent_when_engine_predates_the_field(self):
+        # An older engine writes no pendingMessages. Absent must read as zero, not as "unknown → nag".
+        self.write_state(missions=[{"id": "m1", "title": "Ship the widget", "status": "running"}])
+        self.assertPassesThrough(host="claude")
+
+    def test_silent_when_this_session_does_not_supervise(self):
+        # A bystander session sharing the repo must never have its turn blocked by someone else's
+        # message — the same strictness the Codex path applies.
+        self.owed(2)
+        self.assertPassesThrough(host="claude", session_id="some-other-session")
+
+    def test_silent_when_the_mission_is_not_live(self):
+        self.owed(2, status="paused")
+        self.assertPassesThrough(host="claude")
+
+    def test_silent_under_the_loop_guard(self):
+        # One nudge per turn, so an agent that genuinely cannot continue is never trapped.
+        self.owed(1)
+        self.assertPassesThrough(host="claude", stop_hook_active=True)
+
+    def test_silent_for_a_worker(self):
+        self.owed(1)
+        self.assertPassesThrough(host="claude", env_extra={"MEDLEY_WORKER": "1"})
+
+    def test_codex_still_gets_the_supervision_nudge_not_this_one(self):
+        # Proves the two branches didn't get crossed: on Codex an owed message must still produce the
+        # mission_wait nudge, because there the loop — not a watcher — is what delivers.
+        self.owed(1)
+        _, decision, reason = self.run_hook(host="codex")
+        self.assertEqual(decision, "block")
+        self.assertIn("mission_wait", reason)
+        self.assertNotIn("dashboard", reason.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

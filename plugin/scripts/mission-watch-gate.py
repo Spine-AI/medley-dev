@@ -117,6 +117,49 @@ def supervises(repo: str, session_id, missions) -> bool:
     return any(m["id"] in recorded for m in missions)
 
 
+def nudge_claude_code(repo: str, session_id) -> int:
+    """Claude Code only: block the stop iff a supervised live mission owes the user a reply.
+
+    Returns 0 either way (a Stop hook communicates by what it PRINTS, not by exit code). Silent
+    unless every condition holds, because blocking a turn the user wanted to end is worse than a
+    late-delivered message:
+
+      * a live mission in this repo, which THIS session is confirmed to supervise (same strict
+        binding check the Codex path uses — never hijack a session merely sharing the repo), and
+      * `pendingMessages > 0` on that mission, written by the engine.
+
+    `pendingMessages` absent (an older engine than this plugin) reads as 0, so the hook stays silent
+    rather than nagging on every stop — the same fail-quiet direction as the rest of this file.
+    """
+    missions = live_missions(repo)
+    if not missions:
+        return 0
+    if not supervises(repo, session_id, missions):
+        return 0
+    owed = [m for m in missions if isinstance(m.get("pendingMessages"), int) and m["pendingMessages"] > 0]
+    if not owed:
+        return 0
+    mission = owed[0]
+    count = mission["pendingMessages"]
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": (
+                    'The user sent you %d message%s from the Medley dashboard for mission "%s" and is '
+                    "waiting on you — you have not seen the text yet, and it is not in this transcript. "
+                    "Arm the progress watcher as a BACKGROUND Bash task (run_in_background: true) the "
+                    "same way mission_start told you to; it will hand you what they said as soon as it "
+                    "wakes you, then answer them directly. If you believe a watcher is already armed, "
+                    "say so in one line and end your turn — it will deliver."
+                    % (count, "" if count == 1 else "s", mission.get("title") or "the mission")
+                ),
+            }
+        )
+    )
+    return 0
+
+
 def main() -> int:
     if os.environ.get("MEDLEY_WORKER") == "1":
         return 0  # a worker never supervises
@@ -135,10 +178,22 @@ def main() -> int:
     if payload.get("stop_hook_active") is True:
         return 0
 
-    if not on_codex():
-        return 0  # Claude Code: the background watcher owns supervision there
-
     repo = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+    if not on_codex():
+        # Claude Code: the background watcher owns SUPERVISION here, and this hook must not compete
+        # with it (running both would double-supervise — see the header). The one thing the watcher
+        # cannot cover is a person waiting on an answer: the user typed into the dashboard composer,
+        # and the agent is ending its turn without an armed watcher to hand it over. Nudge it to arm
+        # one; the watcher then drains the outbox, which is cursor-independent precisely so a message
+        # queued while nothing was listening still lands.
+        #
+        # Note what this does NOT do: carry the message. Delivery belongs to the channel that can
+        # atomically claim it, exactly as digest delivery belongs to mission_wait on Codex. A hook
+        # that pasted the text in could not mark it delivered, so the watcher would hand the agent the
+        # same sentence a second time.
+        return nudge_claude_code(repo, payload.get("session_id"))
+
     missions = live_missions(repo)
     if not missions:
         return 0
