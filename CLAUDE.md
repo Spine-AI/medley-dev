@@ -206,6 +206,50 @@ But `~/.medley/engine-path` is **shared with Claude Code**, so a dev-channel Cod
 Claude statusline and the launchd daemon trampoline onto the dev engine too. One `~/.medley`, one
 daemon, one port: do not run Codex and Claude Code against different engine builds at the same time.
 
+## Uninstall — three paths, one list
+
+Neither host has a plugin-uninstall lifecycle hook, so `/plugin uninstall medley` /
+`codex plugin remove` clears only that host's registry + cache. Everything else is cleaned up by one
+of three paths, and all three read the SAME classification from the engine's
+`engine/services/purge-plan.ts`:
+
+1. **Automatic (the default).** The running daemon is the only actor that survives the removal (its
+   binary's inode outlives the unlink), so it detects the orphaned state on its 30s sweep
+   (`orphan-teardown.ts`) and tears itself down: bootout its LaunchAgent, purge every regenerable
+   artifact (~250MB — both hosts' downloaded binaries, the trampoline, the TCC-stable link, the shims
+   and breadcrumbs), then exit. Mission history / `config.toml` / BYOK keys are KEPT — unless there is
+   nothing worth keeping (no missions, no keys), in which case `~/.medley` goes too and a try-once
+   install leaves zero trace. `MEDLEY_ORPHAN_PURGE=0` tears down without purging.
+2. **`medley-engine service uninstall --all [--keep-data]`** — the same purge plus hosts/pf teardown.
+3. **`plugin/scripts/uninstall.sh`** — that, plus each host's cache/marketplace, the `~/.codex/config.toml`
+   tables, the shell alias and the `settings.json` statusLine. ⚠️ `MARKET` scopes the cache/marketplace/
+   config.toml cleanup to THIS channel, but `~/.medley` and the plugin-data dirs are SHARED, so a full
+   (non-`--keep-data`) run from either channel removes the other's mission history too.
+
+Five things to keep in mind when editing any of it:
+
+- **The trigger requires BOTH hosts.** One shared daemon serves Claude Code and Codex and both
+  channels, so `installedOnAnyHost` must read `~/.claude/plugins/installed_plugins.json` AND
+  `~/.codex/config.toml`, matching the plugin name exactly (`key.split('@')[0]`, and the
+  `[plugins."medley@` prefix). Consulting only Claude Code's registry — which it used to — tore the
+  daemon down out from under a live Codex install.
+- **The list is an allowlist-to-DELETE.** Anything unclassified is KEPT. A file a future engine version
+  starts writing then survives an uninstall it was never classified for; the reverse polarity risks
+  someone's mission history. A test asserts `keep ∩ purge = ∅`.
+- **Plugin-data dirs are claimed by OWNERSHIP, never by name.** A dir is `<plugin>-<marketplace>`, so a
+  third-party `medley-foo@bar` matches a `medley-*` glob. `isOwnedDataDir` requires a
+  `bin/medley-engine-*` inside. (The old code instead derived one dir from the running binary and gated
+  it on `basename === 'medley-medley'`, which stranded ~83MB on the dev and inline channels.)
+- **`uninstall.sh` keeps a hand-written copy of the list** — it must work when no binary resolves at
+  all, which is exactly when a user needs it. It prefers `service purge-plan --paths` (tab-separated so
+  no jq/python is required) and falls back to two marked heredocs. The engine's
+  `__tests__/purge-plan.test.ts` diffs the two and fails on drift; it skips when the plugin repo isn't
+  checked out beside the engine, so run the engine suite after touching either file.
+- **Ordering is load-bearing.** The LaunchAgent is removed FIRST and the purge is abandoned if that
+  fails: without the plist gone, KeepAlive relaunches into a purged install and execs a trampoline
+  whose target we just deleted. Leaving everything in place keeps the understood failure mode (exit 78,
+  launchd throttles).
+
 ## Layout
 
 ```
@@ -225,6 +269,8 @@ plugin/scripts/                   {resolve,ensure,run}-engine.sh, session-start.
                                   mcp-gateway.sh (the gateway launcher; ALSO installed to the fixed
                                   path ~/.medley/bin/medley-gateway, pin-strict via breadcrumbs),
                                   mission-watch-gate.py (Codex Stop-hook watcher),
+                                  uninstall.sh (complete teardown — run BEFORE the host's own
+                                  uninstall, which deletes the cache this script lives in),
                                   strip-codex-config.py (uninstall: ~/.codex/config.toml tables)
 plugin/engine/version             engine version pin (release-managed)
 plugin/skills/mission|dashboard   the /mission and /dashboard skills (+ runtimes/ routing guides and

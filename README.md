@@ -47,6 +47,29 @@ suffix:
 cat ~/.medley/engine-path     # …/medley-engine-0.8.6-dev.0
 ```
 
+## Uninstall
+
+Removing the plugin is enough — the orphaned background service tears itself down within about a
+minute (never mid-mission), taking its LaunchAgent, its launcher and every downloaded engine binary
+on every host with it. Mission history, `config.toml` and BYOK keys are kept so a reinstall resumes;
+if you never ran a mission, `~/.medley` goes too.
+
+```
+/plugin uninstall medley@medley-dev          # Claude Code
+codex plugin remove medley@medley-dev        # Codex
+```
+
+For an immediate, total removal run the uninstaller **first** — it ships inside the plugin, so the
+host command above deletes it:
+
+```
+~/.claude/plugins/cache/medley-dev/medley/*/scripts/uninstall.sh   # then the host command above
+```
+
+`--dry-run` shows the plan; `--keep-data` keeps the DB, config and keys (the service is removed
+either way). ⚠️ `~/.medley` is **shared with the stable channel** — a full uninstall from either
+channel removes the other's mission history too, so use `--keep-data` if both are installed.
+
 ## How a dev build reaches you
 
 Engine prereleases are cut as `X.Y.Z-dev.N` from the private engine repo and published by
