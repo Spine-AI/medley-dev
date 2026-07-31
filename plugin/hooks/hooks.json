@@ -30,6 +30,13 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-marker.py\"" }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
