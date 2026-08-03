@@ -44,8 +44,56 @@ NOOP_MARKERS = ("Nothing to resume", "Unknown mission", "already started")
 OBSERVATIONAL = ("status", "wait")
 
 
+def session_is_gone(session_id):
+    """Is the Claude Code session that wrote a binding no longer running?
+
+    Claude Code registers every live session at ~/.claude/sessions/<pid>.json and unlinks it on
+    exit, so an absent entry is a positive statement that the session ended. The pid check is not
+    redundant with that: a session killed with its terminal window never runs its exit handler and
+    leaves a stale entry behind. Mirrors the engine's host-session-liveness.hostSessionState.
+
+    Read-only, and conservative on every failure: an unreadable registry (an older Claude Code, a
+    relocated config dir) answers False — "assume alive" — so a claim is never stolen on a guess.
+    """
+    reg = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
+    try:
+        entries = os.listdir(reg)
+    except OSError:
+        return False  # no registry to consult ⇒ never conclude a session is gone
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(reg, name)) as f:
+                entry = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("sessionId") != session_id:
+            continue
+        pid = entry.get("pid")
+        if not isinstance(pid, int):
+            return False
+        try:
+            os.kill(pid, 0)
+            return False  # running
+        except PermissionError:
+            return False  # someone else's process, but very much alive
+        except OSError:
+            return True  # registered and dead: killed without running its exit handler
+    return True  # the registry lists every live session and does not list this one
+
+
 def claimed_by_other(sessions_dir, session_id, mission_id):
-    """True iff a session OTHER than this one already records mission_id (or "*")."""
+    """True iff a LIVE session OTHER than this one already records mission_id (or "*").
+
+    Liveness is the half that was missing. Binding files outlive their sessions — nothing deletes
+    them — so a dead supervisor's claim blocked every later session from taking the mission over:
+    the user reopened their terminal, called mission_status, and was refused the claim by a session
+    that had not existed for days. The mission then kept a supervisor that could never answer,
+    which is the same conclusion the engine's supervisingSessionId reaches from the other side.
+
+    A live claimant still wins, exactly as before: this only stops the DEAD from holding it.
+    """
     try:
         entries = os.listdir(sessions_dir)
     except OSError:
@@ -60,8 +108,11 @@ def claimed_by_other(sessions_dir, session_id, mission_id):
         except Exception:
             continue
         recorded = other.get("missions") if isinstance(other, dict) else None
-        if isinstance(recorded, list) and (mission_id in recorded or "*" in recorded):
-            return True
+        if not isinstance(recorded, list) or (mission_id not in recorded and "*" not in recorded):
+            continue
+        if session_is_gone(name[: -len(".json")]):
+            continue  # a dead session cannot hold a mission against a live one
+        return True
     return False
 
 

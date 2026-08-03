@@ -333,10 +333,39 @@ class TestRobustness(BinderTestCase):
         self.assertEqual(self.read_binding()["missions"], [MID_A])
 
 
-class TestClaimSemantics(BinderTestCase):
+class LiveSessionRegistryMixin:
+    """A fake ~/.claude/sessions so the hook's liveness check reads OUR registry, not the
+    developer's. Claude Code keys entries by pid and unlinks them on exit, so "alive" needs a real
+    pid and a killed terminal leaves a stale entry behind pointing at a dead one."""
+
+    def setup_registry(self):
+        self._home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._home.cleanup)
+        self.registry = os.path.join(self._home.name, ".claude", "sessions")
+        os.makedirs(self.registry)
+        return self._home.name
+
+    def register(self, session_id, alive):
+        pid = os.getpid() if alive else 999999
+        with open(os.path.join(self.registry, f"{pid}-{session_id}.json"), "w") as f:
+            json.dump({"pid": pid, "sessionId": session_id, "kind": "interactive", "status": "idle"}, f)
+
+    def unregister(self, session_id):
+        """The session exited cleanly: Claude Code removed its entry."""
+        for name in os.listdir(self.registry):
+            if name.endswith(f"-{session_id}.json"):
+                os.unlink(os.path.join(self.registry, name))
+
+
+class TestClaimSemantics(LiveSessionRegistryMixin, BinderTestCase):
     """One supervisor per mission: mission_status / mission_wait must not hand a bystander
     session the supervision (and with it the read-only repo) of a mission another session is
-    already running. start/resume are deliberate and always bind."""
+    already running. start/resume are deliberate and always bind.
+
+    Every "another session holds it" case here means a session that is STILL RUNNING, so the
+    fixture registers it in a fake ~/.claude/sessions. That is not incidental: a claim held by a
+    session that has exited must NOT block anyone (see TestDeadClaimHandover), and without the
+    registry entry these tests would be asserting the old, liveness-blind contract."""
 
     OTHER = "other-session"
 
@@ -345,7 +374,8 @@ class TestClaimSemantics(BinderTestCase):
         # An isolated TMPDIR so no stray continuation marker from another test leaks in.
         self._markers = tempfile.TemporaryDirectory()
         self.addCleanup(self._markers.cleanup)
-        self.env = {"TMPDIR": self._markers.name}
+        self.env = {"TMPDIR": self._markers.name, "HOME": self.setup_registry()}
+        self.register(self.OTHER, alive=True)
 
     def mark_continuation(self, session_id=None):
         open(
@@ -419,6 +449,86 @@ class TestClaimSemantics(BinderTestCase):
         # check then yields to it rather than telling the real supervisor to stand down.
         self.write_binding([MID_A], session_id=self.OTHER)
         self.mark_continuation()
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+
+class TestDeadClaimHandover(LiveSessionRegistryMixin, BinderTestCase):
+    """A claim held by a session that no longer exists must not outlive it.
+
+    Binding files are never deleted, so before this the first session to touch a mission owned it
+    forever. The user closes their terminal, reopens it (a fresh session id), calls mission_status —
+    and is refused the claim by a session that has not existed for days. The mission keeps a
+    supervisor that can never answer, which is the same dead end the engine's supervisingSessionId
+    reaches from the other side."""
+
+    OTHER = "other-session"
+
+    def setUp(self):
+        super().setUp()
+        self._markers = tempfile.TemporaryDirectory()
+        self.addCleanup(self._markers.cleanup)
+        self.env = {"TMPDIR": self._markers.name, "HOME": self.setup_registry()}
+        self.register(self.OTHER, alive=True)
+
+    def status_of(self, mission_id):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Mission 'x' running — 2/5 tasks done.\n"
+                    f"Dashboard: http://localhost:8730/?mission={mission_id}",
+                }
+            ]
+        }
+
+    def observe(self, mission_id, tool="mission_status"):
+        self.bind(tool, tool_input={}, tool_response=self.status_of(mission_id), env_extra=self.env)
+
+    def test_status_claims_a_mission_whose_holder_exited(self):
+        # The clean-exit shape: Claude Code unlinked the registry entry on the way out.
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.unregister(self.OTHER)
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+    def test_status_claims_when_the_holders_process_is_dead(self):
+        # The shape no hook can cover: a closed terminal window or a SIGKILL never runs the exit
+        # handler, so the entry is left behind pointing at a pid that is gone.
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.unregister(self.OTHER)
+        self.register(self.OTHER, alive=False)
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+    def test_a_dead_wildcard_holder_no_longer_blocks_either(self):
+        # "*" is what a recovery resume writes, so a long-dead recovery session was blocking every
+        # observational claim in the whole repo. Two such sessions were found in one real repo.
+        self.write_binding(["*"], session_id=self.OTHER)
+        self.unregister(self.OTHER)
+        self.observe(MID_A)
+        self.assertEqual(self.read_binding()["missions"], [MID_A])
+
+    def test_a_LIVE_holder_still_blocks(self):
+        # The guard this change must not weaken: a bystander still cannot take a running session's
+        # mission, because that would hand it a read-only repo it never asked for.
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.observe(MID_A)
+        self.assertIsNone(self.read_binding())
+
+    def test_an_unreadable_registry_keeps_the_old_refusal(self):
+        # No registry (an older Claude Code, a relocated config dir) must mean "assume alive". A
+        # claim must never be stolen on the strength of evidence we could not read.
+        self.write_binding([MID_A], session_id=self.OTHER)
+        self.unregister(self.OTHER)
+        import shutil
+
+        shutil.rmtree(os.path.join(self._home.name, ".claude"))
+        self.observe(MID_A)
+        self.assertIsNone(self.read_binding())
+
+    def test_a_live_holder_of_a_DIFFERENT_mission_is_irrelevant(self):
+        self.write_binding([MID_B], session_id=self.OTHER)
         self.observe(MID_A)
         self.assertEqual(self.read_binding()["missions"], [MID_A])
 
