@@ -71,6 +71,12 @@ class CatchupTestCase(unittest.TestCase):
         self.assertEqual(parsed["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         return parsed["hookSpecificOutput"]["additionalContext"]
 
+    def shown(self, out):
+        """The systemMessage — what the USER sees in their terminal ("⎿ UserPromptSubmit says: …")."""
+        if out.strip() == "":
+            return None
+        return json.loads(out).get("systemMessage")
+
     # ---- the happy path ----
 
     def test_injects_the_exchange_and_deletes_the_file(self):
@@ -112,6 +118,41 @@ class CatchupTestCase(unittest.TestCase):
         self.assertIn("Do not re-answer", ctx)
         self.assertIn("do not narrate", ctx)
 
+    # ---- the user's copy ----
+
+    def test_shows_the_exchange_to_the_user_too(self):
+        # The whole point: this window never rendered those turns, so the user came back to a terminal
+        # with no trace of a conversation they had just had. Reported twice before this existed.
+        self.write([{"at": 1, "message": "what day is today", "reply": "Monday, August 3, 2026."}])
+        out = self.submit()
+        seen = self.shown(out)
+        self.assertIn("what day is today", seen)
+        self.assertIn("Monday, August 3, 2026.", seen)
+        # Both audiences from one read of the file — the agent still gets its own copy.
+        self.assertIn("what day is today", self.context(out))
+
+    def test_the_users_copy_is_a_receipt_not_a_transcript(self):
+        # They already read the full answer in the dashboard. A wall of text under their prompt would
+        # bury the thing they actually typed.
+        self.write([{"at": i, "message": "m%d" % i, "reply": "r%d " % i + "x" * 600} for i in range(5)])
+        out = self.submit()
+        seen = self.shown(out)
+        self.assertIn("m4", seen)
+        self.assertNotIn("m1", seen)  # only the last few exchanges
+        self.assertIn("(+2 earlier exchanges)", seen)  # and it says so rather than hiding them
+        self.assertIn("…", seen)  # long replies clipped
+        self.assertLess(len(seen), 1200)
+        # The agent's copy is NOT clipped — it needs the whole thing to stay coherent.
+        self.assertIn("x" * 600, self.context(out))
+
+    def test_the_users_copy_counts_one_hidden_exchange_singular(self):
+        self.write([{"at": i, "message": "m%d" % i, "reply": "r%d" % i} for i in range(4)])
+        self.assertIn("(+1 earlier exchange)", self.shown(self.submit()))
+
+    def test_no_user_copy_when_there_is_nothing_to_show(self):
+        # Silence is the common case, and an empty banner on every prompt would be worse than no banner.
+        self.assertIsNone(self.shown(self.submit()))
+
     # ---- silence is the common case ----
 
     def test_says_nothing_when_there_is_no_file(self):
@@ -150,6 +191,23 @@ class CatchupTestCase(unittest.TestCase):
         self.write([{"at": 1, "message": "q", "reply": "a"}])
         self.assertEqual(self.submit(env_extra={"MEDLEY_WORKER": "1"}), "")
         self.assertTrue(os.path.exists(self.path()))  # left for the real session
+
+    def test_ignores_the_engines_own_resumed_turn(self):
+        # The away-delivery rung continues this session headlessly, and that turn submits a prompt — so
+        # this hook fires inside it. Measured going wrong both ways at once: it CONSUMED the note meant
+        # for the human's terminal (read-and-delete), and printed the previous exchange above the reply
+        # it was in the middle of giving, so the away chat looked like it was repeating itself.
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertEqual(self.submit(env_extra={"MEDLEY_RESUME": "1"}), "")
+        self.assertTrue(os.path.exists(self.path()))  # left for the terminal it was written for
+        # And the terminal still gets it on the very next prompt it submits.
+        self.assertIn("q", self.context(self.submit()))
+
+    def test_only_the_exact_resume_marker_silences_it(self):
+        # Fail-loud direction: a stray or empty value must leave the receipt working, or the catch-up
+        # would silently stop for everyone.
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertIn("q", self.context(self.submit(env_extra={"MEDLEY_RESUME": "0"})))
 
     def test_ignores_a_path_unsafe_session_id(self):
         code, out, _ = run_hook(self.payload(session="../escape"))
