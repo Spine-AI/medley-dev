@@ -33,6 +33,11 @@ class WatchGateCase(unittest.TestCase):
         os.makedirs(self.bin)
         shutil.copy(GATE, self.bin)
         self.gate = os.path.join(self.bin, "mission-watch-gate.py")
+        # An isolated engine data dir, ALWAYS. The watcher-gap rung reads dashboard.json/mcp-token from
+        # here; pointing it at a temp dir keeps every test hermetic — without this, a test run on a
+        # machine with a live daemon (and a focused dashboard tab) would change these tests' answers.
+        self.data = os.path.join(self.repo, "state")
+        os.makedirs(self.data)
 
     # --- fixtures -------------------------------------------------------------------------
     def write_state(self, status="running", pid=1, missions="auto", title="Ship the widget"):
@@ -68,6 +73,7 @@ class WatchGateCase(unittest.TestCase):
         }
         env = {k: v for k, v in os.environ.items()
                if k not in ("MEDLEY_WORKER", "PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA")}
+        env["MEDLEY_DATA_DIR"] = self.data  # hermetic — see setUp
         if host == "codex":
             env["PLUGIN_ROOT"] = "/x/.codex/plugins/cache/medley-dev/medley/1.0.0"
         elif host == "codex-datadir":
@@ -303,6 +309,131 @@ class TestClaudeCodeComposerRung(WatchGateCase):
         self.assertEqual(decision, "block")
         self.assertIn("mission_wait", reason)
         self.assertNotIn("dashboard", reason.lower())
+
+
+class TestWatcherGapRung(WatchGateCase):
+    """The SELF-HEALING rung (Claude Code, rung 2): nothing is owed, but the daemon reports the
+    dashboard in use with no watcher parked — the fast path is down, and only this agent can restore
+    it. The rung's whole risk budget is false positives (a wrongly blocked turn), so most of these
+    tests assert SILENCE; the daemon must positively say wanted-and-not-parked before it may fire.
+
+    The daemon here is a real local HTTP server, because the thing under test includes the wire:
+    the token header, the repo query param, the JSON shapes an old engine would and would not send."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_binding("s1", ["m1"])
+        self.seen = []  # (path_with_query, authorization) per request, for asserting the wire
+
+    def daemon(self, body, status=200, token="sekrit", pid=None):
+        """Stand up a fake daemon answering /api/doorbell with `body`, and write the dashboard.json +
+        mcp-token breadcrumbs the gate resolves it from."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        seen = self.seen
+        payload = json.dumps(body).encode() if not isinstance(body, bytes) else body
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 — http.server API
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass  # keep test output clean
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)  # LIFO: runs after shutdown
+        self.addCleanup(server.shutdown)
+        with open(os.path.join(self.data, "dashboard.json"), "w") as fh:
+            json.dump({"port": server.server_address[1], "pid": pid or os.getpid()}, fh)
+        with open(os.path.join(self.data, "mcp-token"), "w") as fh:
+            fh.write(token)
+
+    # ── the case the rung exists for ──────────────────────────────────────────────────────────
+    def test_blocks_to_rearm_when_wanted_and_nothing_parked(self):
+        self.daemon({"wanted": True, "parked": False})
+        code, decision, reason = self.run_hook(host="claude")
+        self.assertEqual((code, decision), (0, "block"))
+        self.assertIn("watcher", reason.lower())
+        self.assertIn("background", reason.lower())
+        # Plumbing must stay invisible: the nudge itself carries the no-narration rule.
+        self.assertIn("do not mention", reason.lower())
+
+    def test_asks_the_daemon_properly(self):
+        # The wire matters: the Bearer token (the daemon 401s without it) and the repo, so presence is
+        # answered for THIS project and not someone else's.
+        self.daemon({"wanted": True, "parked": False}, token="tok-123")
+        self.run_hook(host="claude")
+        self.assertEqual(len(self.seen), 1)
+        path, auth = self.seen[0]
+        self.assertIn("/api/doorbell?repo=", path)
+        self.assertEqual(auth, "Bearer tok-123")
+
+    # ── everything below must stay silent ─────────────────────────────────────────────────────
+    def test_silent_when_a_watcher_is_already_parked(self):
+        self.daemon({"wanted": True, "parked": True})
+        self.assertPassesThrough(host="claude")
+
+    def test_silent_when_nobody_wants_the_dashboard(self):
+        self.daemon({"wanted": False, "parked": False})
+        self.assertPassesThrough(host="claude")
+
+    def test_silent_when_the_engine_is_too_old_to_say(self):
+        # An engine that predates `parked` answers {"wanted": ...} only. Absent must read as "cannot
+        # know", never as "not parked" — else every stop on an old engine nags.
+        self.daemon({"wanted": True})
+        self.assertPassesThrough(host="claude")
+
+    def test_silent_with_no_daemon_at_all(self):
+        self.assertPassesThrough(host="claude")  # no dashboard.json in the (hermetic) data dir
+
+    def test_silent_when_the_daemon_is_dead(self):
+        # A stale dashboard.json from a SIGKILLed daemon must not send the gate knocking on a port
+        # someone else may own now. Same liveness contract as every other breadcrumb.
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        self.daemon({"wanted": True, "parked": False}, pid=proc.pid)
+        self.assertPassesThrough(host="claude")
+        self.assertEqual(self.seen, [])  # never even asked
+
+    def test_silent_for_a_session_with_no_binding_here(self):
+        # A bystander sharing the repo never supervised anything — re-arming from it would create a
+        # second watcher wired to a session the dashboard doesn't belong to.
+        self.daemon({"wanted": True, "parked": False})
+        self.assertPassesThrough(host="claude", session_id="some-other-session")
+        self.assertEqual(self.seen, [])  # the binding check is the cheap gate BEFORE the HTTP call
+
+    def test_silent_under_the_loop_guard(self):
+        self.daemon({"wanted": True, "parked": False})
+        self.assertPassesThrough(host="claude", stop_hook_active=True)
+
+    def test_silent_on_garbage_from_the_daemon(self):
+        self.daemon(b"not json")
+        self.assertPassesThrough(host="claude")
+
+    def test_owed_messages_outrank_the_rearm_nudge(self):
+        # Both rungs true at once → the message rung speaks, because it carries the fact the agent
+        # cannot otherwise know (someone is WAITING). Its nudge re-arms the watcher anyway.
+        self.daemon({"wanted": True, "parked": False})
+        self.write_state(status="completed")
+        with open(os.path.join(self.repo, ".medley", "composer-outbox.json"), "w") as fh:
+            json.dump({"updatedAt": 1, "pid": 1,
+                       "owed": [{"missionId": "m1", "title": "Ship the widget", "count": 1}]}, fh)
+        _, decision, reason = self.run_hook(host="claude")
+        self.assertEqual(decision, "block")
+        self.assertIn("waiting on you", reason)
+
+    def test_codex_path_untouched_by_the_new_rung(self):
+        # No live mission, nothing owed, gap present: Codex must stay silent — its supervision is the
+        # mission_wait loop, and there is no watcher to re-arm on that host.
+        self.daemon({"wanted": True, "parked": False})
+        self.assertPassesThrough(host="codex")
 
 
 if __name__ == "__main__":
