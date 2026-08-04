@@ -346,108 +346,62 @@ class TestClaudeCodeComposerRung(WatchGateCase):
         self.assertNotIn("dashboard", reason.lower())
 
 
-class TestWatcherGapRung(WatchGateCase):
-    """The SELF-HEALING rung (Claude Code, rung 2): nothing is owed, but the daemon reports the
-    dashboard in use with no watcher parked — the fast path is down, and only this agent can restore
-    it. The rung's whole risk budget is false positives (a wrongly blocked turn), so most of these
-    tests assert SILENCE; the daemon must positively say wanted-and-not-parked before it may fire.
+class TestTheGateNeverAsksTheDaemon(WatchGateCase):
+    """A pin on a REMOVED rung. This hook used to carry a second, self-healing rung: nothing owed, but
+    the daemon reporting the dashboard in use with no watcher parked, so it blocked once to get a watcher
+    re-armed. It moved to session-catchup.py's UserPromptSubmit hook, because a Stop hook's only lever is
+    `decision: block` and Claude Code renders that reason to the USER as `Stop hook error: <reason>` — so
+    a nudge that told the agent "do not mention this to the user" was shown to the user, labelled an
+    error, every time. Observed in a real session.
 
-    The daemon here is a real local HTTP server, because the thing under test includes the wire:
-    the token header, the repo query param, the JSON shapes an old engine would and would not send."""
+    These tests stand a daemon right in front of the gate, saying exactly what the old rung fired on, and
+    assert it is never even asked. If they fail, the visible-plumbing bug is back."""
 
     def setUp(self):
         super().setUp()
         self.write_binding("s1", ["m1"])
-
-    # ── the case the rung exists for ──────────────────────────────────────────────────────────
-    def test_blocks_to_rearm_when_wanted_and_nothing_parked(self):
         self.daemon({"wanted": True, "parked": False})
-        code, decision, reason = self.run_hook(host="claude")
-        self.assertEqual((code, decision), (0, "block"))
-        self.assertIn("watcher", reason.lower())
-        self.assertIn("background", reason.lower())
-        # Plumbing must stay invisible: the nudge itself carries the no-narration rule.
-        self.assertIn("do not mention", reason.lower())
 
-    def test_asks_the_daemon_properly(self):
-        # The wire matters: the Bearer token (the daemon 401s without it) and the repo, so presence is
-        # answered for THIS project and not someone else's.
-        self.daemon({"wanted": True, "parked": False}, token="tok-123")
-        self.run_hook(host="claude")
-        self.assertEqual(len(self.seen), 1)
-        path, auth = self.seen[0]
-        self.assertIn("/api/doorbell?repo=", path)
-        self.assertEqual(auth, "Bearer tok-123")
-
-    # ── everything below must stay silent ─────────────────────────────────────────────────────
-    def test_silent_when_a_watcher_is_already_parked(self):
-        self.daemon({"wanted": True, "parked": True})
+    def test_silent_and_unasked_with_a_watcher_gap(self):
         self.assertPassesThrough(host="claude")
+        self.assertEqual(self.seen, [])  # no doorbell call at all — the check does not live here
 
-    def test_silent_when_nobody_wants_the_dashboard(self):
-        self.daemon({"wanted": False, "parked": False})
-        self.assertPassesThrough(host="claude")
-
-    def test_silent_when_the_engine_is_too_old_to_say(self):
-        # An engine that predates `parked` answers {"wanted": ...} only. Absent must read as "cannot
-        # know", never as "not parked" — else every stop on an old engine nags.
-        self.daemon({"wanted": True})
-        self.assertPassesThrough(host="claude")
-
-    def test_silent_with_no_daemon_at_all(self):
-        self.assertPassesThrough(host="claude")  # no dashboard.json in the (hermetic) data dir
-
-    def test_silent_when_the_daemon_is_dead(self):
-        # A stale dashboard.json from a SIGKILLed daemon must not send the gate knocking on a port
-        # someone else may own now. Same liveness contract as every other breadcrumb.
-        proc = subprocess.Popen(["true"])
-        proc.wait()
-        self.daemon({"wanted": True, "parked": False}, pid=proc.pid)
-        self.assertPassesThrough(host="claude")
-        self.assertEqual(self.seen, [])  # never even asked
-
-    def test_silent_for_a_session_with_no_binding_here(self):
-        # A bystander sharing the repo never supervised anything — re-arming from it would create a
-        # second watcher wired to a session the dashboard doesn't belong to.
-        self.daemon({"wanted": True, "parked": False})
-        self.assertPassesThrough(host="claude", session_id="some-other-session")
-        self.assertEqual(self.seen, [])  # the binding check is the cheap gate BEFORE the HTTP call
-
-    def test_silent_under_the_loop_guard(self):
-        self.daemon({"wanted": True, "parked": False})
-        self.assertPassesThrough(host="claude", stop_hook_active=True)
-
-    def test_silent_on_garbage_from_the_daemon(self):
-        self.daemon(b"not json")
-        self.assertPassesThrough(host="claude")
-
-    def test_owed_messages_outrank_the_rearm_nudge(self):
-        # Both rungs true at once → the message rung speaks, because it carries the fact the agent
-        # cannot otherwise know (someone is WAITING). Its nudge re-arms the watcher anyway.
-        self.daemon({"wanted": True, "parked": False})
+    def test_owed_messages_still_block_without_consulting_it(self):
+        # The rung that stayed: someone is waiting, and it must act at the END of this turn rather than
+        # the start of the next. It reaches that decision from the outbox breadcrumb alone.
         self.write_state(status="completed")
         with open(os.path.join(self.repo, ".medley", "composer-outbox.json"), "w") as fh:
             json.dump({"updatedAt": 1, "pid": 1,
                        "owed": [{"missionId": "m1", "title": "Ship the widget", "count": 1}]}, fh)
         _, decision, reason = self.run_hook(host="claude")
         self.assertEqual(decision, "block")
-        self.assertIn("waiting on you", reason)
+        self.assertIn("waiting and unread", reason)
+        self.assertEqual(self.seen, [])
 
-    def test_codex_path_untouched_by_the_new_rung(self):
-        # No live mission, nothing owed, gap present: Codex must stay silent — its supervision is the
-        # mission_wait loop, and there is no watcher to re-arm on that host.
-        self.daemon({"wanted": True, "parked": False})
+    def test_that_reason_is_written_for_the_person_who_will_see_it(self):
+        # It is displayed as `Stop hook error: …`, so it must not contain agent-only stage directions
+        # about hiding itself — that text, shown to a user, is what made this a bug report.
+        self.write_state(status="completed")
+        with open(os.path.join(self.repo, ".medley", "composer-outbox.json"), "w") as fh:
+            json.dump({"updatedAt": 1, "pid": 1,
+                       "owed": [{"missionId": "m1", "title": "Ship the widget", "count": 1}]}, fh)
+        _, _, reason = self.run_hook(host="claude")
+        self.assertNotIn("do not mention", reason.lower())
+        self.assertNotIn("plumbing", reason.lower())
+
+    def test_codex_path_untouched(self):
         self.assertPassesThrough(host="codex")
+        self.assertEqual(self.seen, [])
 
 
 class TestInsideAResumedTurn(WatchGateCase):
     """MEDLEY_RESUME=1 — the engine's away-delivery rung is running one headless turn ON this session.
 
-    Both Claude Code rungs ask for a background Bash task, and a resumed turn is granted read-only
-    tools, so the ask cannot be met: Claude Code answers "This command requires approval". Measured
-    consequence of asking anyway — the agent, blocked and unable to comply, explained the watcher to the
-    user, which every delivery payload forbids. Silence is correct here: the watcher is re-armed by the
-    user's next TERMINAL turn, the only context that can do it."""
+    The Claude Code rung asks for a background Bash task, and a resumed turn is granted read-only tools,
+    so the ask cannot be met: Claude Code answers "This command requires approval". Measured consequence
+    of asking anyway — the agent, blocked and unable to comply, explained the watcher to the user, which
+    every delivery payload forbids. Silence is correct here: the watcher is re-armed by the user's next
+    TERMINAL turn, the only context that can do it."""
 
     def setUp(self):
         super().setUp()
@@ -466,14 +420,8 @@ class TestInsideAResumedTurn(WatchGateCase):
         self.owed_now()
         self.assertPassesThrough(host="claude", env_extra=self.resumed)
 
-    def test_silent_with_a_watcher_gap(self):
-        # A daemon is standing right there saying the fast path is down — and must be left unasked.
-        self.daemon({"wanted": True, "parked": False})
-        self.assertPassesThrough(host="claude", env_extra=self.resumed)
-        self.assertEqual(self.seen, [])  # short-circuits before the wire, not after
-
     def test_only_the_exact_marker_counts(self):
-        # Fail-loud direction for once: an unset or unexpected value must leave the rungs working, or a
+        # Fail-loud direction for once: an unset or unexpected value must leave the rung working, or a
         # stray environment variable would silently disable the composer's backstop for everyone.
         self.owed_now()
         for value in ("0", "", "true", "yes"):

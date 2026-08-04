@@ -17,8 +17,13 @@ import unittest
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session-catchup.py")
 
 
-def run_hook(payload, env_extra=None):
+def run_hook(payload, env_extra=None, data_dir=None):
     env = {k: v for k, v in os.environ.items() if k not in ("MEDLEY_WORKER", "CLAUDE_PROJECT_DIR")}
+    # HERMETIC, ALWAYS. The re-arm rung reads dashboard.json/mcp-token from the engine data dir and will
+    # ask a live daemon whether a watcher is parked. Without an isolated dir here, running these tests on
+    # the developer's own machine — daemon up, dashboard tab focused — would inject a nudge into cases
+    # that assert silence, and the suite's answers would depend on which windows happened to be open.
+    env["MEDLEY_DATA_DIR"] = data_dir or os.path.join(tempfile.gettempdir(), "medley-no-such-datadir")
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
@@ -59,7 +64,8 @@ class CatchupTestCase(unittest.TestCase):
 
     def submit(self, **kw):
         env_extra = kw.pop("env_extra", None)
-        code, out, err = run_hook(self.payload(**kw), env_extra=env_extra)
+        data_dir = kw.pop("data_dir", getattr(self, "data", None))
+        code, out, err = run_hook(self.payload(**kw), env_extra=env_extra, data_dir=data_dir)
         self.assertEqual(code, 0, err)  # must NEVER block a prompt
         return out
 
@@ -233,6 +239,154 @@ class CatchupTestCase(unittest.TestCase):
         code, out, _ = run_hook(p, env_extra={"CLAUDE_PROJECT_DIR": self.repo})
         self.assertEqual(code, 0)
         self.assertIn("q", self.context(out))
+
+
+class RearmNudgeTestCase(CatchupTestCase):
+    """The re-arm rung, moved here from the Stop hook.
+
+    Why it moved: a Stop hook can only speak by blocking, and Claude Code shows a block reason to the
+    USER as `Stop hook error: <reason>`. So the nudge — whose own text told the agent not to mention the
+    watcher to the user — was printed to the user, under the word "error", on every firing. Observed in
+    a real session. The check is unchanged; what changed is that it now rides `additionalContext`, which
+    only the agent reads.
+
+    So the load-bearing assertion in here is `systemMessage is None`: the day this rung becomes visible
+    again is the day it is back to being the bug it was. Everything else guards the other direction —
+    the rung's risk budget is false positives, so the daemon must positively say wanted-and-not-parked."""
+
+    def setUp(self):
+        super().setUp()
+        self.data = os.path.join(self.repo, "state")
+        os.makedirs(self.data)
+        self.seen = []  # (path_with_query, authorization) per doorbell request — asserts the wire
+        self.bind()
+
+    def bind(self, session=None):
+        with open(os.path.join(self.sessions, (session or self.SESSION) + ".json"), "w") as fh:
+            json.dump({"missions": ["m1"], "updatedAt": 1}, fh)
+
+    def daemon(self, body, token="sekrit", pid=None):
+        """A real loopback daemon answering /api/doorbell, plus the breadcrumbs the hook resolves it
+        from. Real HTTP because the wire is part of what broke before: the Bearer token, the repo query
+        param, and the JSON shapes an older engine would and would not send."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        seen = self.seen
+        payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 — http.server API
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)  # LIFO: after shutdown
+        self.addCleanup(server.shutdown)
+        with open(os.path.join(self.data, "dashboard.json"), "w") as fh:
+            json.dump({"port": server.server_address[1], "pid": pid or os.getpid()}, fh)
+        with open(os.path.join(self.data, "mcp-token"), "w") as fh:
+            fh.write(token)
+
+    # ---- the case the rung exists for ----
+
+    def test_nudges_when_the_dashboard_is_open_with_no_watcher(self):
+        self.daemon({"wanted": True, "parked": False})
+        out = self.submit()
+        ctx = self.context(out)
+        self.assertIn("background", ctx.lower())
+        self.assertIn("watcher", ctx.lower())
+        self.assertIn("run_in_background", ctx)
+
+    def test_the_user_never_sees_it(self):
+        # THE REGRESSION THIS RUNG WAS BORN FROM. Nothing user-visible: no systemMessage, and the prompt
+        # is not blocked (exit 0 with a plain additionalContext envelope).
+        self.daemon({"wanted": True, "parked": False})
+        out = self.submit()
+        self.assertIsNone(self.shown(out))
+        parsed = json.loads(out)
+        self.assertNotIn("decision", parsed)  # a UserPromptSubmit hook must never block the prompt
+        self.assertEqual(list(parsed.keys()), ["hookSpecificOutput"])
+
+    def test_asks_the_daemon_properly(self):
+        self.daemon({"wanted": True, "parked": False}, token="tok-123")
+        self.submit()
+        self.assertEqual(len(self.seen), 1)
+        path, auth = self.seen[0]
+        self.assertIn("/api/doorbell?repo=", path)
+        self.assertEqual(auth, "Bearer tok-123")
+
+    def test_rides_along_with_a_catchup_without_disturbing_it(self):
+        # Both jobs at once. The receipt is still the user's whole view, and the agent gets both notes —
+        # the nudge must not displace the catch-up, which is the one with a person waiting behind it.
+        self.daemon({"wanted": True, "parked": False})
+        self.write([{"at": 1, "message": "what day is today", "reply": "Monday."}])
+        out = self.submit()
+        ctx = self.context(out)
+        self.assertIn("what day is today", ctx)
+        self.assertIn("watcher", ctx.lower())
+        seen = self.shown(out)
+        self.assertIn("what day is today", seen)
+        self.assertNotIn("watcher", seen.lower())  # still invisible, even sharing the envelope
+        self.assertFalse(os.path.exists(self.path()))  # and the catch-up is still delivered-once
+
+    # ---- everything below must stay silent ----
+
+    def test_silent_when_a_watcher_is_already_parked(self):
+        self.daemon({"wanted": True, "parked": True})
+        self.assertEqual(self.submit(), "")
+
+    def test_silent_when_nobody_is_at_the_dashboard(self):
+        self.daemon({"wanted": False, "parked": False})
+        self.assertEqual(self.submit(), "")
+
+    def test_silent_when_the_engine_is_too_old_to_say(self):
+        # An engine predating `parked` answers {"wanted": …} only. Absent must read as "cannot know",
+        # never as "not parked" — else every prompt on an old engine carries a nudge.
+        self.daemon({"wanted": True})
+        self.assertEqual(self.submit(), "")
+
+    def test_silent_with_no_daemon_at_all(self):
+        self.assertEqual(self.submit(), "")  # no dashboard.json in the hermetic data dir
+
+    def test_silent_when_the_daemon_is_dead(self):
+        # A stale dashboard.json from a SIGKILLed daemon must not send the hook knocking on a port
+        # someone else may own by now.
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        self.daemon({"wanted": True, "parked": False}, pid=proc.pid)
+        self.assertEqual(self.submit(), "")
+        self.assertEqual(self.seen, [])  # never even asked
+
+    def test_silent_on_garbage_from_the_daemon(self):
+        self.daemon(b"not json")
+        self.assertEqual(self.submit(), "")
+
+    def test_silent_for_a_session_that_never_supervised_anything(self):
+        # A bystander sharing the repo. Re-arming from it would wire a watcher to a session the
+        # dashboard does not belong to — and the binding check is the cheap gate BEFORE the HTTP call.
+        self.daemon({"wanted": True, "parked": False})
+        self.assertEqual(self.submit(session="unbound-session"), "")
+        self.assertEqual(self.seen, [])
+
+    def test_silent_inside_the_engines_own_resumed_turn(self):
+        # A resumed turn gets read-only tools, so it cannot arm anything; asking anyway is what made the
+        # agent explain the watcher to the user in the first place.
+        self.daemon({"wanted": True, "parked": False})
+        self.assertEqual(self.submit(env_extra={"MEDLEY_RESUME": "1"}), "")
+        self.assertEqual(self.seen, [])  # short-circuits before the wire
+
+    def test_silent_for_a_worker(self):
+        self.daemon({"wanted": True, "parked": False})
+        self.assertEqual(self.submit(env_extra={"MEDLEY_WORKER": "1"}), "")
+        self.assertEqual(self.seen, [])
 
 
 if __name__ == "__main__":
