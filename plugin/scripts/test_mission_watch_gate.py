@@ -38,8 +38,43 @@ class WatchGateCase(unittest.TestCase):
         # machine with a live daemon (and a focused dashboard tab) would change these tests' answers.
         self.data = os.path.join(self.repo, "state")
         os.makedirs(self.data)
+        self.seen = []  # (path_with_query, authorization) per doorbell request, for asserting the wire
 
     # --- fixtures -------------------------------------------------------------------------
+    def daemon(self, body, status=200, token="sekrit", pid=None):
+        """Stand up a fake daemon answering /api/doorbell with `body`, and write the dashboard.json +
+        mcp-token breadcrumbs the gate resolves it from.
+
+        Lives on the base case rather than next to the rung that needs it, because "the gate must NOT
+        ask" is as much a fact about a rung as what it does when it does ask — and asserting that needs
+        a daemon standing there, unasked (see TestInsideAResumedTurn)."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        seen = self.seen
+        payload = json.dumps(body).encode() if not isinstance(body, bytes) else body
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 — http.server API
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass  # keep test output clean
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)  # LIFO: runs after shutdown
+        self.addCleanup(server.shutdown)
+        with open(os.path.join(self.data, "dashboard.json"), "w") as fh:
+            json.dump({"port": server.server_address[1], "pid": pid or os.getpid()}, fh)
+        with open(os.path.join(self.data, "mcp-token"), "w") as fh:
+            fh.write(token)
+
     def write_state(self, status="running", pid=1, missions="auto", title="Ship the widget"):
         """pid=1 is always alive (the gate treats PermissionError as alive), so the state is not
         stale unless a test explicitly wants it to be."""
@@ -323,37 +358,6 @@ class TestWatcherGapRung(WatchGateCase):
     def setUp(self):
         super().setUp()
         self.write_binding("s1", ["m1"])
-        self.seen = []  # (path_with_query, authorization) per request, for asserting the wire
-
-    def daemon(self, body, status=200, token="sekrit", pid=None):
-        """Stand up a fake daemon answering /api/doorbell with `body`, and write the dashboard.json +
-        mcp-token breadcrumbs the gate resolves it from."""
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        seen = self.seen
-        payload = json.dumps(body).encode() if not isinstance(body, bytes) else body
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802 — http.server API
-                seen.append((self.path, self.headers.get("Authorization")))
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def log_message(self, *args):
-                pass  # keep test output clean
-
-        server = HTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.server_close)  # LIFO: runs after shutdown
-        self.addCleanup(server.shutdown)
-        with open(os.path.join(self.data, "dashboard.json"), "w") as fh:
-            json.dump({"port": server.server_address[1], "pid": pid or os.getpid()}, fh)
-        with open(os.path.join(self.data, "mcp-token"), "w") as fh:
-            fh.write(token)
 
     # ── the case the rung exists for ──────────────────────────────────────────────────────────
     def test_blocks_to_rearm_when_wanted_and_nothing_parked(self):
@@ -434,6 +438,54 @@ class TestWatcherGapRung(WatchGateCase):
         # mission_wait loop, and there is no watcher to re-arm on that host.
         self.daemon({"wanted": True, "parked": False})
         self.assertPassesThrough(host="codex")
+
+
+class TestInsideAResumedTurn(WatchGateCase):
+    """MEDLEY_RESUME=1 — the engine's away-delivery rung is running one headless turn ON this session.
+
+    Both Claude Code rungs ask for a background Bash task, and a resumed turn is granted read-only
+    tools, so the ask cannot be met: Claude Code answers "This command requires approval". Measured
+    consequence of asking anyway — the agent, blocked and unable to comply, explained the watcher to the
+    user, which every delivery payload forbids. Silence is correct here: the watcher is re-armed by the
+    user's next TERMINAL turn, the only context that can do it."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_binding("s1", ["m1"])
+        self.resumed = {"MEDLEY_RESUME": "1"}
+
+    def owed_now(self):
+        self.write_state(status="completed")
+        with open(os.path.join(self.repo, ".medley", "composer-outbox.json"), "w") as fh:
+            json.dump({"updatedAt": 1, "pid": 1,
+                       "owed": [{"missionId": "m1", "title": "Ship the widget", "count": 1}]}, fh)
+
+    def test_silent_with_a_message_owed(self):
+        # The strongest rung, and the one that actually fired in the wild: the owed breadcrumb can still
+        # read stale for the moment between the claim and the file rewrite.
+        self.owed_now()
+        self.assertPassesThrough(host="claude", env_extra=self.resumed)
+
+    def test_silent_with_a_watcher_gap(self):
+        # A daemon is standing right there saying the fast path is down — and must be left unasked.
+        self.daemon({"wanted": True, "parked": False})
+        self.assertPassesThrough(host="claude", env_extra=self.resumed)
+        self.assertEqual(self.seen, [])  # short-circuits before the wire, not after
+
+    def test_only_the_exact_marker_counts(self):
+        # Fail-loud direction for once: an unset or unexpected value must leave the rungs working, or a
+        # stray environment variable would silently disable the composer's backstop for everyone.
+        self.owed_now()
+        for value in ("0", "", "true", "yes"):
+            with self.subTest(value=value):
+                _, decision, _ = self.run_hook(host="claude", env_extra={"MEDLEY_RESUME": value})
+                self.assertEqual(decision, "block")
+
+    def test_codex_is_unaffected(self):
+        # The marker is a Claude-Code concept (there is no resume rung on Codex), and the Codex path
+        # must behave the same either way.
+        self.write_state(status="running")
+        self.assertNotEqual(self.run_hook(host="codex", env_extra=self.resumed)[1], None)
 
 
 if __name__ == "__main__":

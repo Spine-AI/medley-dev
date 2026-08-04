@@ -250,6 +250,16 @@ def nudge_claude_code(repo: str, session_id) -> int:
     No breadcrumb (an engine older than this plugin, or nothing owed) means silence — the same
     fail-quiet direction as the rest of this file.
     """
+    # NOT IN FRONT OF A HUMAN. Both rungs below ask the agent to arm a background Bash task, and inside
+    # the engine's own RESUMED turn (the away-delivery rung) that request is unmeetable: the resumed turn
+    # is granted read-only tools, so Claude Code answers "This command requires approval", and a task
+    # started there would die with the headless run regardless. Measured consequence of asking anyway:
+    # the agent, blocked and unable to comply, explained Medley's watcher to the user — the one thing
+    # every delivery payload tells it never to do. The gap it would be papering over closes on the
+    # user's next terminal turn, which is the only context that can actually arm the watcher.
+    if os.environ.get("MEDLEY_RESUME") == "1":
+        return 0
+
     owed = owed_messages(repo)
     if owed and supervises_any(repo, session_id, [o["missionId"] for o in owed]):
         total = sum(o["count"] for o in owed)
