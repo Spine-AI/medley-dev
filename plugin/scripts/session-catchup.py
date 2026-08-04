@@ -94,6 +94,57 @@ def clip(text: str, cap: int) -> str:
     return flat if len(flat) <= cap else flat[:cap].rstrip() + "…"
 
 
+def rendered_messages(transcript_path):
+    """The user messages Claude Code will REDRAW on this branch, normalised for comparison.
+
+    Only meaningful at SessionStart, and only because of what the engine now does: it anchors an away
+    turn at the transcript's true tip, so the exchange lands on the branch `--continue` renders and comes
+    back on screen as an ordinary turn — the user's message, then the reply. A receipt for an exchange
+    that is about to redraw itself is the double display the user reported, so this is how we know not to
+    print one.
+
+    A transcript is a TREE and only one branch is rendered, so this walks parents back from the last
+    entry rather than reading the file as a list — an exchange stranded on another branch will NOT be
+    redrawn, and must still get its receipt. Returns an empty set on any doubt (no path, unreadable,
+    unparseable), which means "show the receipt": a duplicate is a much smaller failure than a
+    conversation the user never learns about."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return set()
+    try:
+        rows = []
+        with open(transcript_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue  # a half-written last line is normal on a live transcript
+    except Exception:
+        return set()
+    by_uuid = {r.get("uuid"): r for r in rows if isinstance(r, dict) and r.get("uuid")}
+    with_uuid = [r for r in rows if isinstance(r, dict) and r.get("uuid")]
+    if not with_uuid:
+        return set()
+    seen = set()
+    out = set()
+    cur = with_uuid[-1]
+    while isinstance(cur, dict) and cur.get("uuid") not in seen:
+        seen.add(cur.get("uuid"))
+        if cur.get("type") == "user":
+            content = (cur.get("message") or {}).get("content")
+            if isinstance(content, str):
+                out.add(" ".join(content.split()))
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        out.add(" ".join(block["text"].split()))
+        parent = cur.get("parentUuid")
+        cur = by_uuid.get(parent) if parent else None
+    return out
+
+
 def has_binding(repo: str, session_id: str) -> bool:
     """True iff this session ever supervised a mission here — a binding file exists for it.
 
@@ -177,6 +228,18 @@ def main():
 
     repo = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     entries = read_catchup(repo, session_id)
+
+    # NO DOUBLE DISPLAY. On reopening, Claude Code redraws its branch — and an away exchange the engine
+    # anchored correctly is ON that branch, so it comes back as an ordinary turn: the user's message, then
+    # the reply, exactly like one they typed here. Printing a receipt for it too is the duplicate the user
+    # reported. So at SessionStart we drop the exchanges that are about to redraw themselves and keep only
+    # the ones that will not — an exchange stranded on another branch, or one from an engine too old to
+    # anchor. Not applied to UserPromptSubmit: there the window never repainted, so being on the branch
+    # says nothing about whether the user has actually seen it.
+    if event == "SessionStart" and entries:
+        drawn = rendered_messages(payload.get("transcript_path"))
+        if drawn:
+            entries = [e for e in entries if " ".join(e["message"].split()) not in drawn]
 
     # INDEPENDENT OF THE CATCH-UP FILE, and evaluated even when there is none — the common case for the
     # nudge is precisely a quiet session with nothing to catch up on. Ordered second so a missing daemon

@@ -294,6 +294,75 @@ class ReopenTheTerminalTestCase(CatchupTestCase):
     def test_silent_when_there_is_nothing_to_catch_up_on(self):
         self.assertEqual(self.reopen(), "")  # every ordinary session start
 
+    # ---- no double display ----
+
+    def transcript(self, branch, off_branch=()):
+        """A transcript where `branch` are user messages on the rendered chain and `off_branch` are
+        stranded on a sibling — the shape the engine used to leave behind."""
+        path = os.path.join(self.repo, "transcript.jsonl")
+        rows, parent = [], None
+        for i, text in enumerate(off_branch):
+            rows.append({"type": "user", "uuid": "off-u%d" % i, "parentUuid": "root",
+                         "message": {"role": "user", "content": text}})
+        for i, text in enumerate(branch):
+            uid = "on-u%d" % i
+            rows.append({"type": "user", "uuid": uid, "parentUuid": parent,
+                         "message": {"role": "user", "content": text}})
+            rows.append({"type": "assistant", "uuid": "on-a%d" % i, "parentUuid": uid,
+                         "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}})
+            parent = "on-a%d" % i
+        with open(path, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        return path
+
+    def reopen_with(self, transcript_path, **kw):
+        p = self.payload(event="SessionStart", **kw)
+        p["transcript_path"] = transcript_path
+        self._event = "SessionStart"
+        code, out, err = run_hook(p, data_dir=getattr(self, "data", None))
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_no_receipt_for_an_exchange_the_terminal_redraws(self):
+        # The engine anchors an away turn at the transcript's tip, so it comes back on screen as an
+        # ordinary turn. A receipt for it as well is the double display that was reported.
+        self.write([{"at": 1, "message": "who is the pm of india?", "reply": "Narendra Modi."}])
+        path = self.transcript(["hello", "who is the pm of india?"])
+        self.assertEqual(self.reopen_with(path), "")
+        self.assertFalse(os.path.exists(self.path()))  # still consumed — delivered by the redraw
+
+    def test_receipt_survives_for_a_stranded_exchange(self):
+        # The case the receipt exists for: an older engine, or an anchor that was refused, leaves the
+        # exchange on a sibling branch. Claude Code will not redraw it, so it must still be shown.
+        self.write([{"at": 1, "message": "who is the pm of india?", "reply": "Narendra Modi."}])
+        path = self.transcript(["hello"], off_branch=["who is the pm of india?"])
+        seen = self.shown(self.reopen_with(path))
+        self.assertIn("who is the pm of india?", seen)
+
+    def test_shows_only_the_exchanges_that_are_missing(self):
+        self.write([
+            {"at": 1, "message": "who is the pm of india?", "reply": "Narendra Modi."},
+            {"at": 2, "message": "and president of usa", "reply": "Donald Trump."},
+        ])
+        path = self.transcript(["and president of usa"], off_branch=["who is the pm of india?"])
+        seen = self.shown(self.reopen_with(path))
+        self.assertIn("pm of india", seen)
+        self.assertNotIn("president of usa", seen)
+
+    def test_shows_everything_when_the_transcript_cannot_be_read(self):
+        # Fail toward the receipt: a duplicate line is a far smaller failure than a conversation the user
+        # never learns about.
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertIn("q", self.shown(self.reopen_with("/nonexistent/transcript.jsonl")))
+
+    def test_prompt_path_ignores_the_branch_entirely(self):
+        # An idle window never repaints, so "it is on the rendered branch" says nothing about whether the
+        # user has seen it. Only SessionStart — an actual redraw — may suppress.
+        self.write([{"at": 1, "message": "who is the pm of india?", "reply": "Narendra Modi."}])
+        self.transcript(["who is the pm of india?"])
+        self.assertIn("pm of india", self.shown(self.submit()))
+
     def test_ignores_the_engines_own_resumed_turn(self):
         # MEASURED: a headless `--resume` fires SessionStart (source=resume) too. Without the guard the
         # engine's own away turn would eat the receipt meant for the human's terminal — the same bug the
