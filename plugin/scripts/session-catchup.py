@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-# UserPromptSubmit hook. Two jobs, both about the same channel, both cheap and both silent unless there
-# is something to say:
+# SessionStart + UserPromptSubmit hook. Two jobs, both about the same channel, both cheap and both
+# silent unless there is something to say:
 #
-#   1. CATCH-UP — tell this session about the dashboard exchanges it handled while idle (below).
+#   1. CATCH-UP — show the dashboard exchanges this session handled while idle (below). It runs on
+#      BOTH events for one reason: the user reopens their terminal and LOOKS. Firing only on their next
+#      prompt meant they saw an empty screen and concluded the messages were lost — reported exactly
+#      that. `SessionStart` is the moment they are looking, so that is when the receipt has to appear;
+#      `UserPromptSubmit` stays wired for the window that opens after a session has already started
+#      (they leave it running, chat in the dashboard, come back and type). Whichever fires first
+#      read-and-deletes, so the exchange is shown once either way.
 #   2. RE-ARM — if the dashboard is open with no watcher parked, ask the agent to arm one
 #      (`watcher_gap` / REARM_NUDGE). This rung used to live in the `Stop` hook, where its only way to
 #      speak was to block the turn — which Claude Code renders to the USER as `Stop hook error: …`. A
@@ -161,7 +167,8 @@ def main():
         return
     if not isinstance(payload, dict):
         return
-    if payload.get("hook_event_name") != "UserPromptSubmit":
+    event = payload.get("hook_event_name")
+    if event not in ("UserPromptSubmit", "SessionStart"):
         return
 
     session_id = payload.get("session_id")
@@ -174,7 +181,13 @@ def main():
     # INDEPENDENT OF THE CATCH-UP FILE, and evaluated even when there is none — the common case for the
     # nudge is precisely a quiet session with nothing to catch up on. Ordered second so a missing daemon
     # can never cost the catch-up its delivery.
-    nudge = REARM_NUDGE if has_binding(repo, session_id) and watcher_gap(repo) else None
+    #
+    # UserPromptSubmit ONLY. The nudge asks the agent to arm a background task, which it can only do
+    # inside a turn; at SessionStart there is no turn, and the instruction would sit in context until the
+    # user happens to type — by which point this hook has run again anyway and asked afresh.
+    nudge = None
+    if event == "UserPromptSubmit" and has_binding(repo, session_id) and watcher_gap(repo):
+        nudge = REARM_NUDGE
 
     if not entries and not nudge:
         return  # the overwhelmingly common case: nothing to say, say nothing
@@ -191,8 +204,10 @@ def main():
     if nudge:
         context.append(nudge)
 
+    # The envelope must name the event it is answering — a mismatched hookEventName is rejected as
+    # invalid hook output, which Claude Code surfaces to the user as a hook error.
     out["hookSpecificOutput"] = {
-        "hookEventName": "UserPromptSubmit",
+        "hookEventName": event,
         "additionalContext": "\n\n".join(context),
     }
     print(json.dumps(out))

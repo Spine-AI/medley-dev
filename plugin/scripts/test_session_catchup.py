@@ -54,27 +54,38 @@ class CatchupTestCase(unittest.TestCase):
             for e in entries:
                 f.write(json.dumps(e) + "\n")
 
-    def payload(self, session=None, cwd=None, prompt="what next?"):
-        return {
-            "hook_event_name": "UserPromptSubmit",
+    def payload(self, session=None, cwd=None, prompt="what next?", event="UserPromptSubmit"):
+        p = {
+            "hook_event_name": event,
             "session_id": session if session is not None else self.SESSION,
             "cwd": cwd if cwd is not None else self.repo,
-            "prompt": prompt,
         }
+        if event == "UserPromptSubmit":
+            p["prompt"] = prompt
+        else:
+            p["source"] = "resume"  # what `claude --continue` / `--resume` sends
+        return p
 
     def submit(self, **kw):
         env_extra = kw.pop("env_extra", None)
         data_dir = kw.pop("data_dir", getattr(self, "data", None))
+        self._event = kw.get("event", "UserPromptSubmit")
         code, out, err = run_hook(self.payload(**kw), env_extra=env_extra, data_dir=data_dir)
         self.assertEqual(code, 0, err)  # must NEVER block a prompt
         return out
 
-    def context(self, out):
+    def reopen(self, **kw):
+        """Open the session — what the user does when they come back to their terminal."""
+        return self.submit(event="SessionStart", **kw)
+
+    def context(self, out, event=None):
         """The additionalContext this hook injected, or None. Also asserts the envelope shape."""
         if out.strip() == "":
             return None
         parsed = json.loads(out)  # any non-JSON stdout would corrupt the hook protocol
-        self.assertEqual(parsed["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
+        # The envelope must name the event it answers; a mismatch is invalid hook output.
+        self.assertEqual(parsed["hookSpecificOutput"]["hookEventName"],
+                         event or getattr(self, "_event", "UserPromptSubmit"))
         return parsed["hookSpecificOutput"]["additionalContext"]
 
     def shown(self, out):
@@ -241,6 +252,62 @@ class CatchupTestCase(unittest.TestCase):
         self.assertIn("q", self.context(out))
 
 
+class ReopenTheTerminalTestCase(CatchupTestCase):
+    """SessionStart — the moment the user is actually LOOKING.
+
+    The bug: firing only on UserPromptSubmit meant someone who reopened their terminal and read the
+    screen saw nothing, and concluded the dashboard messages were lost. They were not lost — the file
+    was sitting there, waiting for them to type. Reported as "I don't see the message I entered"."""
+
+    def test_shows_the_exchange_when_the_session_opens(self):
+        self.write([{"at": 1, "message": "who is prime minister of india", "reply": "Narendra Modi."}])
+        out = self.reopen()
+        seen = self.shown(out)
+        self.assertIn("who is prime minister of india", seen)
+        self.assertIn("Narendra Modi.", seen)
+        # And the agent is caught up in the same breath, or its next answer contradicts the screen.
+        self.assertIn("who is prime minister of india", self.context(out, "SessionStart"))
+
+    def test_shows_every_exchange_not_just_the_last(self):
+        # The reported case was two dashboard messages while away; one of them went missing.
+        self.write([
+            {"at": 1, "message": "who is prime minister of india", "reply": "Narendra Modi."},
+            {"at": 2, "message": "and president of usa", "reply": "Donald Trump."},
+        ])
+        seen = self.shown(self.reopen())
+        self.assertIn("prime minister", seen)
+        self.assertIn("president of usa", seen)
+
+    def test_delivered_once_across_both_events(self):
+        # Whichever event fires first consumes the file; the other must not repeat it.
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertIn("q", self.context(self.reopen(), "SessionStart"))
+        self.assertFalse(os.path.exists(self.path()))
+        self.assertIsNone(self.context(self.submit()))
+
+    def test_the_prompt_path_still_works_when_the_session_was_already_open(self):
+        # The window this hook was built for: session left running, chat in the dashboard, come back
+        # and type. No SessionStart fires there, so UserPromptSubmit must still deliver.
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertIn("q", self.context(self.submit()))
+
+    def test_silent_when_there_is_nothing_to_catch_up_on(self):
+        self.assertEqual(self.reopen(), "")  # every ordinary session start
+
+    def test_ignores_the_engines_own_resumed_turn(self):
+        # MEASURED: a headless `--resume` fires SessionStart (source=resume) too. Without the guard the
+        # engine's own away turn would eat the receipt meant for the human's terminal — the same bug the
+        # UserPromptSubmit guard was added for, one event over.
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertEqual(self.reopen(env_extra={"MEDLEY_RESUME": "1"}), "")
+        self.assertTrue(os.path.exists(self.path()))
+
+    def test_ignores_a_worker(self):
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        self.assertEqual(self.reopen(env_extra={"MEDLEY_WORKER": "1"}), "")
+        self.assertTrue(os.path.exists(self.path()))
+
+
 class RearmNudgeTestCase(CatchupTestCase):
     """The re-arm rung, moved here from the Stop hook.
 
@@ -387,6 +454,21 @@ class RearmNudgeTestCase(CatchupTestCase):
         self.daemon({"wanted": True, "parked": False})
         self.assertEqual(self.submit(env_extra={"MEDLEY_WORKER": "1"}), "")
         self.assertEqual(self.seen, [])
+
+    def test_not_at_session_start(self):
+        # There is no turn at SessionStart, so the agent cannot arm anything; the ask would sit in
+        # context until the user typed, by which point UserPromptSubmit asks again anyway. Opening a
+        # terminal must also not cost a daemon round-trip.
+        self.daemon({"wanted": True, "parked": False})
+        self.assertEqual(self.reopen(), "")
+        self.assertEqual(self.seen, [])
+
+    def test_a_catchup_at_session_start_carries_no_nudge(self):
+        self.daemon({"wanted": True, "parked": False})
+        self.write([{"at": 1, "message": "q", "reply": "a"}])
+        ctx = self.context(self.reopen(), "SessionStart")
+        self.assertIn("q", ctx)
+        self.assertNotIn("watcher", ctx.lower())
 
 
 if __name__ == "__main__":
