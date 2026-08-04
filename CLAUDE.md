@@ -262,13 +262,23 @@ plugin/.codex-plugin/plugin.json  Codex manifest — inline mcpServers, no `hook
                                   rejects one; the runtime finds hooks/hooks.json by path anyway)
 plugin/.mcp.json                  http MCP server → daemon /mcp (headersHelper: scripts/mcp-headers.sh)
 plugin/hooks/hooks.json           SessionStart/PreCompact → session-start.sh; PreToolUse gate;
-                                  Stop → mission-watch-gate.py (Codex supervision)
+                                  Stop → mission-watch-gate.py (Codex supervision + the Claude Code
+                                  composer rung); SessionEnd → session-end-marker.py;
+                                  UserPromptSubmit → session-catchup.py
 plugin/scripts/                   {resolve,ensure,run}-engine.sh, session-start.sh, statusline.sh,
                                   edit-conflict-gate.py, medley-mcp.sh (installed to the fixed path
                                   ~/.medley/bin/medley-mcp for hosts with no plugin env — Codex),
                                   mcp-gateway.sh (the gateway launcher; ALSO installed to the fixed
                                   path ~/.medley/bin/medley-gateway, pin-strict via breadcrumbs),
-                                  mission-watch-gate.py (Codex Stop-hook watcher),
+                                  mission-watch-gate.py (Stop hook: Codex supervision watcher, and
+                                  on Claude Code the one rung that blocks an agent from going idle
+                                  while the dashboard composer is owed a reply — it nudges the agent
+                                  to re-arm the watcher rather than carrying the message, since only
+                                  a channel that can atomically claim it may deliver it),
+                                  session-end-marker.py + session-catchup.py (the same channel's
+                                  closed-terminal and reopened-terminal halves: the marker lets the
+                                  engine resume the session, the catch-up shows you what it said),
+                                  session-mission-binder.py (binds a session to the live mission),
                                   uninstall.sh (complete teardown — run BEFORE the host's own
                                   uninstall, which deletes the cache this script lives in),
                                   strip-codex-config.py (uninstall: ~/.codex/config.toml tables)

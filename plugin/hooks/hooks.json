@@ -14,6 +14,13 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-catchup.py\"" }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Task|Bash|apply_patch|spawn_agent",
@@ -27,6 +34,13 @@
         "matcher": "mcp__.*__mission_(start|resume|status|wait)",
         "hooks": [
           { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-mission-binder.py\"" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-marker.py\"" }
         ]
       }
     ],
