@@ -3,7 +3,8 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"" }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"" },
+          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-catchup.py\"" }
         ]
       }
     ],

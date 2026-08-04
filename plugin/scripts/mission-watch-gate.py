@@ -165,78 +165,25 @@ def supervises_any(repo: str, session_id, mission_ids) -> bool:
     return supervises(repo, session_id, [{"id": mid} for mid in mission_ids])
 
 
-def has_binding(repo: str, session_id) -> bool:
-    """True iff this session ever supervised anything here — a binding file exists for it.
-
-    The cheap pre-check for the watcher-gap rung: a session with no binding is a bystander sharing the
-    repo, and nudging it to arm a watcher would hijack unrelated work. Same path-safety rules as
-    `supervises`."""
-    if not isinstance(session_id, str) or not session_id:
-        return False
-    if "/" in session_id or os.sep in session_id or session_id in (".", ".."):
-        return False
-    return os.path.isfile(os.path.join(repo, ".medley", "host-sessions", session_id + ".json"))
-
-
-def watcher_gap(repo: str) -> bool:
-    """True iff the daemon says the dashboard is in use for this repo but NO watcher is parked.
-
-    That combination is the one state only the agent can repair: the user is (or was moments ago) at
-    the dashboard, so anything they type should land in this terminal live — but live delivery needs a
-    parked background watcher, and only the agent can create a background task. Left alone, the gap
-    self-heals only when the NEXT dashboard message arrives the slow way, which is exactly the latency
-    this rung exists to remove.
-
-    Asks the daemon because both halves are its knowledge: presence is in-memory focus state, and
-    "parked" is literally an open long-poll it is holding. Everything here fails toward False —
-    a missing daemon, a stale dashboard.json, a timeout, or an engine too old to report `parked`
-    (key absent) all mean "no nudge", never a trapped turn. Budget: one local HTTP call with a hard
-    1s timeout, only reached when a binding exists for this session."""
-    data_dir = os.environ.get("MEDLEY_DATA_DIR") or os.path.join(
-        os.path.expanduser("~"), ".medley", "state"
-    )
-    try:
-        with open(os.path.join(data_dir, "dashboard.json")) as fh:
-            info = json.load(fh)
-        port = info.get("port")
-        pid = info.get("pid")
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except PermissionError:
-                pass  # alive, owned by someone else — same probe as live_missions
-            except Exception:
-                return False  # dead daemon → stale file → no nudge
-        with open(os.path.join(data_dir, "mcp-token")) as fh:
-            token = fh.read().strip()
-        if not isinstance(port, int) or not token:
-            return False
-        import urllib.request
-        from urllib.parse import quote
-
-        req = urllib.request.Request(
-            "http://127.0.0.1:%d/api/doorbell?repo=%s" % (port, quote(repo, safe="")),
-            headers={"Authorization": "Bearer " + token},
-        )
-        with urllib.request.urlopen(req, timeout=1) as resp:
-            answer = json.load(resp)
-        if not isinstance(answer, dict):
-            return False
-        return answer.get("wanted") is True and answer.get("parked") is False
-    except Exception:
-        return False
-
-
 def nudge_claude_code(repo: str, session_id) -> int:
-    """Claude Code only: two rungs, strongest first.
+    """Claude Code only: block the stop iff this session owes the user a reply they typed into the
+    dashboard's mission chat.
 
-    Rung 1 — block the stop iff this session owes the user a reply they typed into the dashboard's
-    mission chat. Rung 2 — with nothing owed, block once to re-arm the watcher iff the daemon reports
-    the dashboard is in use but no watcher is parked (see watcher_gap): the fast path is down and only
-    this agent can bring it back.
+    ONE rung, and it must stay one. There used to be a second, self-healing rung here: with nothing
+    owed but the daemon reporting the dashboard in use and no watcher parked, it blocked once to get a
+    watcher re-armed. It worked, and it was still wrong — see `watcher_nudge` in session-catchup.py,
+    which now does that job invisibly. A `Stop` hook has exactly one lever, `decision: block`, and
+    Claude Code renders that reason to the USER as `Stop hook error: <reason>`. So the rung whose whole
+    point was to close a gap *quietly* announced itself, in the agent's own idiom, every time — text
+    reading "do not mention this to the user" displayed to the user, under the word "error". Reported
+    from a real session. Nothing about the check was wrong; the hook it lived in was.
 
-    Returns 0 either way (a Stop hook communicates by what it PRINTS, not by exit code). Rung 1 is
-    silent unless both conditions hold, because blocking a turn the user wanted to end is worse than a
+    What stays here is the rung that cannot move: someone is WAITING. It has to act at the end of this
+    turn, not at the start of the next one, so a visible line is the right trade — and the copy below
+    is written to be read by the person who will see it, not only by the agent.
+
+    Returns 0 either way (a Stop hook communicates by what it PRINTS, not by exit code). Silent unless
+    both conditions hold, because blocking a turn the user wanted to end is worse than a
     late-delivered message:
 
       * something is owed for a mission in this repo, per the engine's outbox breadcrumb, and
@@ -250,13 +197,13 @@ def nudge_claude_code(repo: str, session_id) -> int:
     No breadcrumb (an engine older than this plugin, or nothing owed) means silence — the same
     fail-quiet direction as the rest of this file.
     """
-    # NOT IN FRONT OF A HUMAN. Both rungs below ask the agent to arm a background Bash task, and inside
+    # NOT IN FRONT OF A HUMAN. The rung below asks the agent to arm a background Bash task, and inside
     # the engine's own RESUMED turn (the away-delivery rung) that request is unmeetable: the resumed turn
     # is granted read-only tools, so Claude Code answers "This command requires approval", and a task
     # started there would die with the headless run regardless. Measured consequence of asking anyway:
     # the agent, blocked and unable to comply, explained Medley's watcher to the user — the one thing
-    # every delivery payload tells it never to do. The gap it would be papering over closes on the
-    # user's next terminal turn, which is the only context that can actually arm the watcher.
+    # every delivery payload tells it never to do. Whatever this would have papered over is picked up by
+    # the user's next terminal turn, which is the only context that can actually arm a watcher.
     if os.environ.get("MEDLEY_RESUME") == "1":
         return 0
 
@@ -264,47 +211,24 @@ def nudge_claude_code(repo: str, session_id) -> int:
     if owed and supervises_any(repo, session_id, [o["missionId"] for o in owed]):
         total = sum(o["count"] for o in owed)
         title = owed[0].get("title") or "the mission"
+        # WRITTEN FOR TWO READERS. Claude Code shows this to the user as `Stop hook error: <reason>`, so
+        # it opens with the fact that explains itself to a person — a message is waiting, unread — and
+        # only then instructs the agent. No "this is plumbing, do not mention it": that line was
+        # incoherent the moment it was displayed, and here there is nothing to hide anyway. The user
+        # typed the message; being told it is on its way is useful, not noise.
         print(
             json.dumps(
                 {
                     "decision": "block",
                     "reason": (
-                        'The user sent you %d message%s from the Medley dashboard for mission "%s" and is '
-                        "waiting on you — you have not seen the text yet, and it is not in this transcript. "
-                        "Arm the progress watcher as a BACKGROUND Bash task (run_in_background: true) the "
-                        "same way mission_start told you to; it will hand you what they said as soon as it "
-                        "wakes you, then answer them directly. Keep re-arming it afterwards so they can "
-                        "keep talking to you here — that watcher is the only way the dashboard can reach "
-                        "you. If one is already armed, say so in one line and end your turn; it will "
-                        "deliver."
-                        % (total, "" if total == 1 else "s", title)
-                    ),
-                }
-            )
-        )
-        return 0
-
-    # THE SELF-HEALING RUNG. Nothing is owed — but if the user is at the dashboard and no watcher is
-    # parked, the fast path is down and only this agent can restore it (only the agent can create a
-    # background task). Without this, a watcher that stood down while the user was away stays down
-    # until a dashboard message arrives the slow way; with it, the user's very next terminal turn —
-    # any turn, about anything — quietly re-arms it, so the gap closes at the first sign of life.
-    #
-    # Strictly narrower than it looks: only sessions with a binding here (has_binding) are candidates,
-    # the daemon must positively report wanted-and-not-parked (watcher_gap fails toward False on any
-    # doubt, including an engine too old to say), and stop_hook_active bounds it to one nudge per turn.
-    if has_binding(repo, session_id) and watcher_gap(repo):
-        print(
-            json.dumps(
-                {
-                    "decision": "block",
-                    "reason": (
-                        "The user has the Medley dashboard open but this session has no progress "
-                        "watcher armed, so nothing they type there can reach you live. Re-arm the "
-                        "watcher now as a BACKGROUND Bash task (run_in_background: true), the same "
-                        "way mission_start told you to, then end your turn. This is plumbing — do "
-                        "not mention it or the watcher to the user, and do not repeat or revise "
-                        "your previous answer. If one is already armed, just end your turn."
+                        '%d message%s from the Medley dashboard for mission "%s" %s waiting and unread — '
+                        "the text has not reached this transcript yet. Arm the progress watcher as a "
+                        "BACKGROUND Bash task (run_in_background: true) the same way mission_start told "
+                        "you to; it hands you what they said as soon as it wakes you, and then you can "
+                        "answer them directly. Keep re-arming it afterwards so they can keep talking to "
+                        "you here — that watcher is the only live channel from the dashboard. If one is "
+                        "already armed, say so in one line and end your turn; it will deliver."
+                        % (total, "" if total == 1 else "s", title, "is" if total == 1 else "are")
                     ),
                 }
             )
