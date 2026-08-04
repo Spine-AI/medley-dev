@@ -1,6 +1,6 @@
 {
   "name": "medley",
-  "version": "0.9.1-dev.0",
+  "version": "0.9.1-dev.1",
   "description": "[DEV CHANNEL] Missions inside Codex: give /mission a goal and Medley plans the work, then supervises execution until the goal is met \u2014 bringing you in for the higher-level decisions and reviews that actually need you, not routine approvals. Work is distributed across models and runtimes you configure. Steer any time from the chat or a live dashboard; everything stays on your machine except model calls.",
   "author": {
     "name": "Spine",
