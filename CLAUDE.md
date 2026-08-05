@@ -163,7 +163,24 @@ reference in a shipped file — always go through the resolver.
   reports **info**-level findings while brew's default threshold hides them — so a bare local run went
   green on an `SC2015` (`A && B || C`) that failed CI. Prefer `if/then` over `A && B || C` regardless.
 
-### Under Codex CLI (0.145+)
+### Under Codex CLI (0.142+ required, 0.145+ measured)
+
+**0.142.0 is a hard floor, and the failure names nothing.** `mcpServers` in
+`plugin/.codex-plugin/plugin.json` is camelCase-only from 0.142.0; ≤0.141 knows only snake_case
+`mcp_servers` and rejects the ENTIRE manifest on the unknown key — `codex plugin add medley@medley-dev`
+dies with a bare `Error: missing or invalid plugin.json` (no field, no path), while
+`codex plugin marketplace add` succeeds, so it reads like a broken repo. Bisected 2026-08-06:
+0.138.0/0.139.0/0.140.0/0.141.0 fail; 0.142.0 → 0.147.0-alpha.6.5 install. Even `"mcpServers": {}`
+fails on 0.141, while every other field we ship parses there. **Never "fix" this by renaming to
+`mcp_servers`:** 0.142+ ignores that spelling and falls back to `plugin/.mcp.json`, silently swapping
+our `--host codex` stdio launcher for the Claude wiring (http `:8730`, `${CLAUDE_PLUGIN_ROOT}` paths,
+`headersHelper` — unsupported on Codex); confirmed with `codex mcp list` on 0.141/0.142/0.146.1/0.147a.
+`scripts/codex-dev-install.sh` preflights this. Reproduce host-version questions against a throwaway
+`CODEX_HOME=$(mktemp -d)` — every `codex plugin`/`mcp` subcommand honors it, so nothing touches `~/.codex`.
+
+`codex plugin marketplace` has **no `update` subcommand** — it is `upgrade` (stable's README currently
+documents `update`, which errors out).
+
 
 Codex has no `--plugin-dir`; it only loads plugins it has **copied** into
 `~/.codex/plugins/cache` from a configured marketplace. So the loop is bump-cachebuster → reinstall →

@@ -18,6 +18,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN="$REPO/plugin"
 MARKETPLACE="medley-dev"
 VALIDATOR="$HOME/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py"
+# Manifest floor: `mcpServers` in .codex-plugin/plugin.json is camelCase-only from 0.142.0. Older
+# builds know just snake_case `mcp_servers` and reject the WHOLE manifest on the unknown key —
+# `codex plugin add` then dies with a bare "missing or invalid plugin.json" that names no field and
+# points at no file. Bisected: 0.138-0.141 fail, 0.142.0 through 0.147.0-alpha install.
+# Do NOT "fix" that by renaming the key: 0.142+ ignores the snake_case form and falls back to
+# plugin/.mcp.json, which carries the CLAUDE wiring (http :8730, ${CLAUDE_PLUGIN_ROOT} paths, a
+# headersHelper Codex has no support for), silently dropping the `--host codex` stdio launcher.
+MIN_CODEX="0.142.0"
 
 case "${1:-}" in
   --clear-engine)
@@ -32,6 +40,24 @@ case "${1:-}" in
     echo "✓ pinned engine → $(cat "$HOME/.medley/engine-override")"
     ;;
 esac
+
+# 0. Preflight the host CLI, so an unsupported one fails here with the reason rather than at step 4
+#    with a manifest error that reads like a bug in this repo.
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex CLI not found on PATH — install it with: brew install codex" >&2
+  exit 1
+fi
+CODEX_VER="$(codex --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ -z "$CODEX_VER" ]; then
+  echo "! could not parse \`codex --version\` — skipping the >= $MIN_CODEX check" >&2
+elif [ "$(printf '%s\n%s\n' "$MIN_CODEX" "$CODEX_VER" | sort -V | head -1)" != "$MIN_CODEX" ]; then
+  echo "codex $CODEX_VER is too old for this plugin's manifest — need >= $MIN_CODEX." >&2
+  echo "  \`codex plugin add\` would fail with: Error: missing or invalid plugin.json" >&2
+  echo "  Upgrade with: brew upgrade codex   (or: npm i -g @openai/codex@latest)" >&2
+  exit 1
+else
+  echo "✓ codex $CODEX_VER (>= $MIN_CODEX)"
+fi
 
 # 1. Install the fixed-path MCP launcher. The SessionStart hook does this too, but a Codex session
 #    starts plugin MCP servers without ever guaranteeing the hook ran (and the hook trust gate can
