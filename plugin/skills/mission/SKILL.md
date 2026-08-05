@@ -115,12 +115,17 @@ deadline?, constraints?, permission_mode?})`** →
   permission gate on a risky tool call, not by raising a clean attention item the way
   claude-code or codex (via its ask-user tool) can. Say this if a cursor task is likely to
   hit genuine ambiguity it would otherwise want to ask about.
+  **Pi caveat**: pi tasks are *neither* gated *nor* sandboxed — Pi ships no permission system
+  at all, so a pi worker runs with the user's full permissions and its worktree is the only
+  boundary. `guarded` on a pi task is guarded in name only. Always say this when a pi task is
+  in play, and keep destructive work off pi (see `runtimes/pi.md`).
 
 It returns the **routing rubric** (complexity class → model, per ready runtime — a runtime
-appears only when its CLI is installed and logged in: `claude` always, `codex` and `agent`
-[Cursor] optionally. Medley auto-discovers whichever subset is present — a user with only
-one or two of the three still gets a working pool). Echo the contract back to the
-user in 2-3 lines: goal, constraints, permission mode, and the rubric — e.g.
+appears only when its CLI is installed and logged in. Medley auto-discovers whichever subset
+is present, so read the pool it hands you rather than assuming one: `claude` is the usual
+constant, with `codex`, `agent` [Cursor], OpenCode, Kimi and `pi` each appearing only if that
+user set it up. A user with only one of them still gets a working pool). Echo the contract
+back to the user in 2-3 lines: goal, constraints, permission mode, and the rubric — e.g.
 "claude: simple→Haiku, standard→Sonnet, complex→Opus · codex: simple→luna, … · cursor:
 simple→auto, …". When more than one runtime is ready, read the bundled `runtimes/<id>.md`
 guidance for each before decomposing, so per-task runtime fit is grounded in the policy
@@ -189,7 +194,10 @@ Per node:
   terminal-native command-driven loops (build/CI/test-running/env setup), well-specified
   self-contained implementation, and bulk mechanical batches → `codex`; typical well-scoped
   feature/bugfix work with no strong reason to prefer one model family, or when model
-  diversity itself is useful (a second opinion alongside claude-code/codex) → `cursor`.
+  diversity itself is useful (a second opinion alongside claude-code/codex) → `cursor`;
+  additive, self-contained work the user wants on their own Pi setup, or a second opinion
+  from whatever model they signed Pi into → `pi`, but never for anything destructive,
+  ambiguous, or app-bound (it has no approval gate, no sandbox, and no MCP reach).
   Runtime choice is yours to make silently — never a question to the user. (Omitting the
   field falls back to the deterministic prefer order, which resolves to claude-code by
   default — a fallback, not a recommendation.)
