@@ -587,6 +587,20 @@ class TestEngineRolledMidMission(GateTestCase):
         code, decision, _ = self.bash(f'rm "{bundle}" watch')
         self.assertEqual((code, decision), (0, "deny"))
 
+    def test_pointer_may_name_a_suffixless_symlink_to_a_bundle(self):
+        # A dev pin is often a versioned-looking symlink (so ensure-engine.sh's monotonic guard
+        # protects it) whose target is the bundle. node records the REALPATH in argv[1], which is
+        # what the watch command then carries — so classify on the realpath, not the pointer's name.
+        bundle = os.path.join(self.medley, "dist", "medley-engine.cjs")
+        os.makedirs(os.path.dirname(bundle))
+        open(bundle, "w").close()
+        link = os.path.join(self.medley, "bin", "medley-engine-0.9.1-dev.9")
+        os.symlink(bundle, link)
+        self.point_engine_path(link)
+        self.write_state(engine={"execPath": self.rolled_to})
+        code, decision, _ = self.bash(f'"{shutil.which("node") or "node"}" "{bundle}" watch')
+        self.assertEqual((code, decision), (0, None))
+
     def test_pruned_binary_denies_as_STALE_with_the_corrected_line(self):
         self.point_engine_path(self.rolled_to)
         self.write_state(engine={"execPath": self.rolled_to})

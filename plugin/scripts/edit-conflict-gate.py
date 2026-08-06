@@ -202,10 +202,13 @@ def blessed_engines():
     except Exception:
         target = ""
     if target:
-        # A dev bundle is run as `node <bundle>` (exactly what the trampoline does); a binary
-        # is exec'd directly.
-        if target.endswith((".cjs", ".js", ".mjs")):
-            out.append({"execPath": None, "entry": target})
+        # A dev bundle is run as `node <bundle>` (exactly what the trampoline does); a binary is
+        # exec'd directly. Classify on the REALPATH: a pointer may name a symlink with no suffix,
+        # and node resolves the main module's realpath before recording argv[1] anyway — so that is
+        # the spelling the engine's own watch command carries.
+        real = os.path.realpath(target)
+        if real.endswith((".cjs", ".js", ".mjs")):
+            out.append({"execPath": None, "entry": real})
         else:
             out.append({"execPath": target})
     return out
