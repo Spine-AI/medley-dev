@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "medley",
-  "version": "0.9.1-dev.1",
+  "version": "0.9.1-dev.3",
   "description": "[DEV CHANNEL] Missions inside Claude Code: give /mission a goal and Medley plans the work, then supervises execution until the goal is met \u2014 bringing you in for the higher-level decisions and reviews that actually need you, not routine approvals. Work is distributed across models: Claude by default, extending to GPT, open-source, and others you configure when that buys performance or token efficiency. Steer any time from Claude Code or a live dashboard, and everything stays on your machine \u2014 nothing leaves your local environment except model calls and optional debug info.",
   "author": {
     "name": "Spine",
