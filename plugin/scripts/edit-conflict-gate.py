@@ -175,22 +175,75 @@ def _same_file(a: str, b: str) -> bool:
         return False
 
 
+def blessed_engines():
+    """Engine spellings this MACHINE currently vouches for, beyond the one mission-state.json
+    declares. Both come from fixed paths under ~/.medley, so no engine call is needed.
+
+    WHY (measured): the watch command the agent re-arms all mission long is minted ONCE, at
+    mission_start, from the daemon that was running then. `engine` in mission-state.json is
+    rewritten by whichever daemon is running NOW. Anything that changes the daemon's binary
+    mid-mission — an engine roll on a machine whose exec identity is the versioned path, a
+    dev override flipping to the downloaded binary — desyncs the two, and the realpath match
+    below then fails on the ONE command the engine itself told the agent to keep running. It
+    is denied as "could mutate the workers' tree", which is both wrong and unactionable: the
+    observed outcome was the agent reporting a false positive to the user and going quiet,
+    because that watcher is also the dashboard chat's only way back to it.
+
+    Accepting these is not a loosening: the stable link IS the engine (a hard link launchd
+    execs the daemon from), and engine-path is the pointer the trampoline itself reads to
+    decide what to boot. The read-only verb allowlist still applies to both."""
+    out = []
+    medley = os.path.join(os.path.expanduser("~"), ".medley")
+    # The TCC-stable hard link — refreshed by the launcher on every roll, so it never goes stale.
+    out.append({"execPath": os.path.join(medley, "bin", "medley-engine")})
+    try:
+        with open(os.path.join(medley, "engine-path")) as fh:
+            target = fh.read().strip()
+    except Exception:
+        target = ""
+    if target:
+        # A dev bundle is run as `node <bundle>` (exactly what the trampoline does); a binary
+        # is exec'd directly.
+        if target.endswith((".cjs", ".js", ".mjs")):
+            out.append({"execPath": None, "entry": target})
+        else:
+            out.append({"execPath": target})
+    return out
+
+
 def engine_readonly(tokens, engine) -> bool:
-    """True iff tokens invoke the daemon's own declared binary with a read-only verb.
-    engine.execPath is the running binary (pkg) or node itself (dev, where engine.entry is
-    the bundle both must match). A bare `medley-engine` head resolves through PATH first, so
+    """True iff tokens invoke a blessed engine binary with a read-only verb — the one declared
+    in mission-state.json, or one of `blessed_engines()`."""
+    if not tokens:
+        return False
+    candidates = [engine] if isinstance(engine, dict) else list(engine or [])
+    return any(_engine_call_readonly(tokens, c) for c in candidates + blessed_engines())
+
+
+def _engine_call_readonly(tokens, engine) -> bool:
+    """One candidate. engine.execPath is the running binary (pkg) or node itself (dev, where
+    engine.entry is the bundle both must match); execPath None means "any node-ish head, the
+    bundle is what identifies it". A bare `medley-engine` head resolves through PATH first, so
     the deny message's own `medley-engine service status` suggestion passes when a shim/
     symlink to the real binary is installed."""
     if not isinstance(engine, dict) or not tokens:
         return False
+    if engine.get("execPath") is None and isinstance(engine.get("entry"), str):
+        head = tokens[0]
+        if os.path.basename(head) not in ("node", "node.exe"):
+            return False
+        return _engine_verb_readonly(tokens[1:], engine.get("entry"))
     exec_path = engine.get("execPath")
     if not isinstance(exec_path, str) or not exec_path:
         return False
     head = tokens[0] if "/" in tokens[0] else (shutil.which(tokens[0]) or tokens[0])
     if not _same_file(head, exec_path):
         return False
-    args = tokens[1:]
-    entry = engine.get("entry")
+    return _engine_verb_readonly(tokens[1:], engine.get("entry"))
+
+
+def _engine_verb_readonly(args, entry) -> bool:
+    """The args AFTER the engine's own head: an optional bundle path (dev mode) then a verb."""
     if isinstance(entry, str) and entry:
         if not args or not _same_file(args[0], entry):
             return False
@@ -284,12 +337,14 @@ def segment_is_readonly(tokens, engine=None) -> bool:
     return False
 
 
-def command_is_readonly(cmd: str, engine=None) -> bool:
+def command_segments(cmd: str):
+    """`cmd` split into connector-separated token lists, or None on any parse anomaly (which
+    every caller must treat as "could mutate", never as "empty")."""
     if not isinstance(cmd, str) or not cmd.strip():
-        return False
+        return None
     # Command substitution can hide anything; deny even inside quotes.
     if "`" in cmd or "$(" in cmd:
-        return False
+        return None
     # Newlines separate commands like ';' does, but shlex eats them as whitespace.
     cmd = cmd.replace("\r", ";").replace("\n", ";")
     try:
@@ -297,7 +352,7 @@ def command_is_readonly(cmd: str, engine=None) -> bool:
         lex.whitespace_split = True
         tokens = list(lex)
     except ValueError:
-        return False  # unbalanced quotes etc. → parse anomaly
+        return None  # unbalanced quotes etc. → parse anomaly
     segments, cur = [], []
     for tok in tokens:
         if tok and all(c in PUNCT_CHARS for c in tok):
@@ -305,15 +360,69 @@ def command_is_readonly(cmd: str, engine=None) -> bool:
                 segments.append(cur)
                 cur = []
             else:
-                return False  # unquoted > >> < & ( ) … → deny
+                return None  # unquoted > >> < & ( ) … → deny
         else:
             cur.append(tok)
     segments.append(cur)
     if segments and segments[-1] == []:
         segments.pop()  # trailing ';' is fine
     if not segments or any(not s for s in segments):
-        return False  # empty command or dangling connector → parse anomaly
+        return None  # empty command or dangling connector → parse anomaly
+    return segments
+
+
+def command_is_readonly(cmd: str, engine=None) -> bool:
+    segments = command_segments(cmd)
+    if segments is None:
+        return False
     return all(segment_is_readonly(s, engine) for s in segments)
+
+
+def _requote(tok: str) -> str:
+    """Shell-safe enough for a deny MESSAGE (we never execute it) — keeps VAR="value" readable."""
+    if SHELL_ASSIGNMENT.match(tok) and "=" in tok:
+        name, _, val = tok.partition("=")
+        return '%s="%s"' % (name, val)
+    return tok if tok and all(c.isalnum() or c in "-_=./:" for c in tok) else '"%s"' % tok
+
+
+def current_engine_prefix():
+    """How to spell the engine THIS machine runs, on a command line — or None if nothing resolves."""
+    for cand in blessed_engines():
+        entry, exec_path = cand.get("entry"), cand.get("execPath")
+        if exec_path is None and entry:
+            if os.path.exists(entry):
+                return 'node "%s"' % entry
+        elif exec_path and os.path.exists(exec_path):
+            return '"%s"' % exec_path
+    return None
+
+
+def restated_engine_command(cmd: str):
+    """`cmd` re-spelled against the engine this machine runs NOW — or None when it isn't a lone
+    engine invocation with a read-only verb.
+
+    This exists for one command: the progress watcher. Its command line is minted once, at
+    mission_start, and re-run for the life of the mission (and past it — it is the dashboard
+    chat's only way back to the agent). If the daemon's binary changes underneath it, the old
+    spelling is both un-vouchable AND usually gone from disk, and the generic "could mutate the
+    workers' tree" denial sends the agent looking for a bug in the gate. Handing back the
+    corrected line lets it re-arm on its own instead."""
+    prefix = current_engine_prefix()
+    segments = command_segments(cmd)
+    if prefix is None or segments is None or len(segments) != 1:
+        return None
+    tokens, lead = segments[0], []
+    while tokens and SHELL_ASSIGNMENT.match(tokens[0]):
+        lead.append(tokens[0])
+        tokens = tokens[1:]
+    idx = 1 if tokens and os.path.basename(tokens[0]) in ("node", "node.exe") else 0
+    if len(tokens) <= idx or not os.path.basename(tokens[idx]).startswith("medley-engine"):
+        return None
+    verb = tokens[idx + 1 :]
+    if not _engine_verb_readonly(verb, None):
+        return None
+    return " ".join([_requote(t) for t in lead] + [prefix] + [_requote(v) for v in verb])
 
 
 # Mission statuses in which live workers may be changing files (mirrors the engine's
@@ -412,6 +521,16 @@ def lockdown_deny_reason(state, missions):
         cmd = tool_input.get("command") or ""
         if command_is_readonly(cmd, state.get("engine")):
             return None
+        restated = restated_engine_command(cmd)
+        if restated:
+            # Not a mutation — a stale engine spelling. Say so, and hand back the current line.
+            return (
+                f"STALE WATCHER COMMAND (not a permission problem): that names an engine build "
+                f"this machine no longer runs — the engine rolled since the mission started, so "
+                f"the binary in your command is neither vouched for nor still on disk. Re-arm with "
+                f"this instead, same background task and description:\n  {restated}\n"
+                f"Nothing else about {phrase} changed."
+            )
         return (
             f"STOP: {phrase} — only read-only commands "
             "may run in the repo (reads, read-only git). This command could mutate "
