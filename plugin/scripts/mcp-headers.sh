@@ -104,4 +104,20 @@ if ! curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
   ) &
 fi
 
-printf '{"Authorization":"Bearer %s"%s%s}\n' "$TOKEN" "$PIN_HDR" "$TERM_HDR"
+# An AWAY TURN declares itself, so the daemon serves the away flavour of the orchestrator: no
+# `mission_wait` (it would hold the mission's composer slot for minutes with nothing able to interrupt
+# it) and supervision guidance that says "the engine wakes you" instead of "arm a background watcher" —
+# which a headless turn cannot do, and which it kept visibly trying to.
+#
+# This replaces an in-proc `type:'sdk'` server the engine used to inject for the same purpose. That
+# server was keyed `plugin_medley_medley`, the same name THIS entry already has, so two servers claimed
+# one tool prefix — and being served over the SDK↔CLI control protocol it vanished mid-turn, taking
+# every tool call with it. Over HTTP there is one server and a control-protocol hiccup cannot take it.
+#
+# MEDLEY_RESUME is set by the engine on the turn it resumes (host-session-resume's RESUME_ENV) and
+# reaches this helper the way it reaches the plugin's hooks — the spawned Claude Code process hands its
+# environment to its subprocesses. Absent → nothing is added, so every other client is untouched.
+AWAY_HDR=""
+if [ "${MEDLEY_RESUME:-}" = "1" ]; then AWAY_HDR=',"X-Medley-Away":"1"'; fi
+
+printf '{"Authorization":"Bearer %s"%s%s%s}\n' "$TOKEN" "$PIN_HDR" "$TERM_HDR" "$AWAY_HDR"
