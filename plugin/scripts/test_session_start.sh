@@ -46,6 +46,23 @@ assert_missing "$out" "--suggest" "PreCompact omits --suggest"
 out="$(printf '%s' '{"hook_event_name":"SessionStart"}' | HOME="$tmp" MEDLEY_DATA_DIR="$tmp" MEDLEY_ENGINE="$FAKE" MEDLEY_DAEMON=0 MEDLEY_WORKER=1 bash "$SS" 2>/dev/null)"
 assert_missing "$out" "ENGINE_ARGS" "worker emits nothing"
 
+# 3b. An AWAY TURN exits early too, and this one is load-bearing rather than tidy.
+#
+# The engine resumes the user's session headlessly when their terminal is closed, so SessionStart
+# fires — and Claude Code reconnects its permission IPC during `SessionStart:resume`. A hook still
+# running across that reconnect orphans the channel for the rest of the turn (claude-code#44435).
+# Measured three times: every tool call came back "The user doesn't want to take this action right
+# now" instantly, the engine's own in-proc MCP server was ABSENT from the SDK's init report, and the
+# turn still ended success — so the agent told the user every route was closed. It hit the FIRST away
+# turn after an engine roll every time, which is exactly when this hook has real work to do instead of
+# returning in milliseconds. Nothing it does is wanted headlessly: no TUI, no statusline, and the
+# engine is already running. `session-catchup.py` and `mission-watch-gate.py` already stand down on
+# this same flag.
+out="$(printf '%s' '{"hook_event_name":"SessionStart","source":"resume","session_id":"s-away","cwd":"'"$tmp"'"}' \
+  | HOME="$tmp" TMPDIR="$tmp" MEDLEY_DATA_DIR="$tmp" MEDLEY_ENGINE="$FAKE" MEDLEY_DAEMON=0 MEDLEY_WORKER="" MEDLEY_RESUME=1 bash "$SS" 2>/dev/null)"
+assert_missing "$out" "ENGINE_ARGS" "away turn emits nothing"
+if [ -e "$tmp/medley-continuation-s-away" ]; then echo "FAIL [away turn writes no continuation marker]"; fail=1; fi
+
 # 4. The session id is forwarded, so the reminder can tell this session's own missions from
 #    another session's (supervisor vs bystander wording — host-session-bindings.ts).
 out="$(run '{"hook_event_name":"SessionStart","source":"startup","session_id":"s-fresh","cwd":"'"$tmp"'"}')"
