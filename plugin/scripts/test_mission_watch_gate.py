@@ -429,11 +429,109 @@ class TestInsideAResumedTurn(WatchGateCase):
                 _, decision, _ = self.run_hook(host="claude", env_extra={"MEDLEY_RESUME": value})
                 self.assertEqual(decision, "block")
 
-    def test_codex_is_unaffected(self):
-        # The marker is a Claude-Code concept (there is no resume rung on Codex), and the Codex path
-        # must behave the same either way.
+    def test_codex_away_turns_are_left_alone_too(self):
+        # This used to assert the OPPOSITE, on the premise that the marker was a Claude-Code concept
+        # because Codex had no away-delivery rung. It has one now — the engine continues a closed Codex
+        # thread to answer the dashboard — and it runs as a real `codex exec` child, so Codex fires this
+        # hook INSIDE it. Every rung would then ask that turn for something it cannot do: arm a background
+        # task that dies with the headless run, or call a tool it was deliberately given no MCP server for.
+        # An agent blocked on an impossible instruction narrates the plumbing instead of answering, which is
+        # the one thing every delivery payload forbids.
         self.write_state(status="running")
-        self.assertNotEqual(self.run_hook(host="codex", env_extra=self.resumed)[1], None)
+        self.assertPassesThrough(host="codex", env_extra=self.resumed)
+
+    def test_codex_still_nudges_an_ordinary_turn(self):
+        # The guard must key on the marker and nothing else, or a stray variable would silently disable
+        # supervision for every real Codex turn.
+        self.write_state(status="running")
+        self.assertEqual(self.run_hook(host="codex")[1], "block")
+
+
+class TestCodexComposerRung(WatchGateCase):
+    """The Codex twin of the Claude composer rung: no mission live, but somebody is still waiting.
+
+    This is what keeps the chat two-way after the work is done. With no mission live the agent has stopped
+    looping mission_wait, so on this host nothing picks the message up until the daemon gives up waiting and
+    continues the thread from outside — answering into a terminal the user is not looking at, instead of the
+    one they are sitting in.
+    """
+
+    def owe(self, count=1, mission_id="m1", title="Ship the widget"):
+        with open(os.path.join(self.repo, ".medley", "composer-outbox.json"), "w") as fh:
+            json.dump({"updatedAt": 1, "pid": 1,
+                       "owed": [{"missionId": mission_id, "title": title, "count": count}]}, fh)
+
+    def owed_and_bound(self, status="completed", **kw):
+        self.write_state(status=status)
+        self.write_binding("s1", ["m1"])
+        self.owe(**kw)
+
+    def test_blocks_when_a_message_is_owed_and_no_mission_is_live(self):
+        self.owed_and_bound()
+        code, decision, reason = self.run_hook(host="codex")
+        self.assertEqual((code, decision), (0, "block"))
+        self.assertIn("Ship the widget", reason)
+
+    def test_names_mission_wait_and_forbids_the_watcher_this_host_cannot_collect(self):
+        # The one instruction that differs from the Claude rung. A watcher armed here could never be
+        # collected (no wake-on-exit), and mission_wait is the channel that CLAIMS what it hands over.
+        self.owed_and_bound()
+        _, _, reason = self.run_hook(host="codex")
+        self.assertIn("mission_wait", reason)
+        self.assertIn("Do NOT arm a background watcher", reason)
+
+    def test_does_not_carry_the_message_itself(self):
+        # Only a channel that can atomically claim a row may deliver it. A hook that pasted the text in
+        # could not mark it delivered, so the next mission_wait would hand over the same sentence again.
+        self.owed_and_bound()
+        _, _, reason = self.run_hook(host="codex")
+        self.assertIn("has not reached this thread yet", reason)
+
+    def test_silent_when_nothing_is_owed(self):
+        # Blocking a turn the user wanted to end is worse than a late-delivered message.
+        self.write_state(status="completed")
+        self.write_binding("s1", ["m1"])
+        self.assertPassesThrough(host="codex")
+
+    def test_silent_when_another_session_supervises_that_mission(self):
+        # Never hijack a session merely sharing the repo — the same strict binding check every rung uses.
+        self.write_state(status="completed")
+        self.write_binding("someone-else", ["m1"])
+        self.owe()
+        self.assertPassesThrough(host="codex", session_id="s1")
+
+    def test_counts_more_than_one(self):
+        self.owed_and_bound(count=3)
+        _, _, reason = self.run_hook(host="codex")
+        self.assertIn("3 messages", reason)
+        self.assertIn("are waiting", reason)
+
+    def test_a_wildcard_binding_counts(self):
+        self.write_state(status="completed")
+        self.write_binding("s1", ["*"])
+        self.owe()
+        self.assertEqual(self.run_hook(host="codex")[1], "block")
+
+    def test_silent_inside_an_away_turn(self):
+        # The away turn IS the delivery; nudging it would be asking it to deliver to itself, with tools it
+        # does not have.
+        self.owed_and_bound()
+        self.assertPassesThrough(host="codex", env_extra={"MEDLEY_RESUME": "1"})
+
+    def test_a_live_mission_takes_the_other_rung(self):
+        # Precedence: with a mission live the agent belongs back in the mission_wait loop, which drains the
+        # outbox on its own. Only the no-live-mission case needs this rung.
+        self.owed_and_bound(status="running")
+        _, _, reason = self.run_hook(host="codex")
+        self.assertIn("still live", reason)
+
+    def test_claude_code_never_takes_this_rung(self):
+        # `medley-dev` installs under both hosts, so the host gate is load-bearing: telling a Claude agent
+        # to sit in mission_wait would trade a cheap idle channel for a held turn.
+        self.owed_and_bound()
+        _, _, reason = self.run_hook(host="claude")
+        self.assertIn("Arm the progress watcher", reason)
+        self.assertNotIn("mission_wait", reason)
 
 
 if __name__ == "__main__":

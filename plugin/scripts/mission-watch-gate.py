@@ -197,16 +197,8 @@ def nudge_claude_code(repo: str, session_id) -> int:
     No breadcrumb (an engine older than this plugin, or nothing owed) means silence — the same
     fail-quiet direction as the rest of this file.
     """
-    # NOT IN FRONT OF A HUMAN. The rung below asks the agent to arm a background Bash task, and inside
-    # the engine's own RESUMED turn (the away-delivery rung) that request is unmeetable: the resumed turn
-    # is granted read-only tools, so Claude Code answers "This command requires approval", and a task
-    # started there would die with the headless run regardless. Measured consequence of asking anyway:
-    # the agent, blocked and unable to comply, explained Medley's watcher to the user — the one thing
-    # every delivery payload tells it never to do. Whatever this would have papered over is picked up by
-    # the user's next terminal turn, which is the only context that can actually arm a watcher.
-    if os.environ.get("MEDLEY_RESUME") == "1":
-        return 0
-
+    # (The away-turn guard that used to sit here now runs in main() for BOTH hosts — see MEDLEY_RESUME
+    # there. The reasoning is unchanged; only its scope grew, because Codex away turns fire this hook too.)
     owed = owed_messages(repo)
     if owed and supervises_any(repo, session_id, [o["missionId"] for o in owed]):
         total = sum(o["count"] for o in owed)
@@ -236,6 +228,48 @@ def nudge_claude_code(repo: str, session_id) -> int:
     return 0
 
 
+def nudge_codex_composer(repo: str, session_id) -> int:
+    """Codex only: block the stop iff this session owes the user a reply they typed into the dashboard's
+    mission chat, and no mission is live to keep it in the `mission_wait` loop.
+
+    The same rung as `nudge_claude_code`, with the one instruction that differs on this host. There the
+    live channel is a background watcher; here arming one is explicitly wrong — Codex has no wake-on-exit,
+    so it could never be collected — and the channel is `mission_wait`, which drains the outbox and CLAIMS
+    what it hands over.
+
+    Which is also why this, like its Claude twin, does NOT carry the message. Only a channel that can
+    atomically claim a row may deliver it; a hook that pasted the text in could not mark it delivered, so
+    the next `mission_wait` would hand the agent the same sentence again.
+
+    Gated exactly as the Claude rung is — something owed for a mission in this repo, and THIS session
+    confirmed to supervise it, never a session merely sharing the repo — and silent otherwise, because
+    blocking a turn the user wanted to end is worse than a late-delivered message. Not gated on mission
+    status: the whole case is "the work is done and the user is still talking".
+    """
+    owed = owed_messages(repo)
+    if not owed or not supervises_any(repo, session_id, [o["missionId"] for o in owed]):
+        return 0
+    total = sum(o["count"] for o in owed)
+    title = owed[0].get("title") or "the mission"
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": (
+                    '%d message%s from the Medley dashboard for mission "%s" %s waiting and unread — the '
+                    "text has not reached this thread yet. Call mission_wait now: it hands you what they "
+                    "said, and then answer them directly as ordinary text — that text is what reaches "
+                    "them. Do NOT arm a background watcher on this host (there is no wake-on-exit, so it "
+                    "would never be collected). If they are still talking, keep calling mission_wait "
+                    "between replies; that is the only live channel from the dashboard here."
+                    % (total, "" if total == 1 else "s", title, "is" if total == 1 else "are")
+                ),
+            }
+        )
+    )
+    return 0
+
+
 def main() -> int:
     if os.environ.get("MEDLEY_WORKER") == "1":
         return 0  # a worker never supervises
@@ -256,6 +290,21 @@ def main() -> int:
 
     repo = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 
+    # NOT IN FRONT OF A HUMAN — checked for BOTH hosts, before anything else can nudge.
+    #
+    # This used to live inside the Claude Code branch, because only that host's away turn ran through a
+    # hook at all. The Codex away turn (the engine continuing a closed thread to answer the dashboard) is
+    # a real `codex exec` child, so Codex fires this very hook inside it — and every rung below asks the
+    # agent for something an away turn cannot do: arm a background task that would die with the headless
+    # run, or call a tool the turn was deliberately given no MCP server for. The measured consequence of
+    # asking anyway, on Claude Code, was an agent that could not comply explaining Medley's plumbing to the
+    # user instead of answering them.
+    #
+    # Nothing is lost by staying quiet: the away turn is ALREADY the delivery, and whatever this would have
+    # arranged is picked up by the user's next real turn in that terminal.
+    if os.environ.get("MEDLEY_RESUME") == "1":
+        return 0
+
     if not on_codex():
         # Claude Code: the background watcher owns SUPERVISION here, and this hook must not compete
         # with it (running both would double-supervise — see the header). The one thing the watcher
@@ -272,7 +321,13 @@ def main() -> int:
 
     missions = live_missions(repo)
     if not missions:
-        return 0
+        # No live mission — but the dashboard chat outlives the mission by design, so somebody may still
+        # be waiting. This is the Codex twin of `nudge_claude_code`, and it is the rung that keeps the
+        # chat two-way after the work is done: with no mission live, the agent has stopped looping
+        # mission_wait, so nothing on this host would pick the message up until the daemon gave up
+        # waiting and continued the thread from outside. Getting it delivered HERE means it is answered
+        # in the terminal the user is actually sitting in.
+        return nudge_codex_composer(repo, payload.get("session_id"))
     if not supervises(repo, payload.get("session_id"), missions):
         return 0
 

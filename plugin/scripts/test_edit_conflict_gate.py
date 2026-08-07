@@ -86,7 +86,19 @@ class GateTestCase(unittest.TestCase):
         }
 
     def gate(self, tool_name, tool_input, env_extra=None):
-        return run_gate(self.payload(tool_name, tool_input), env_extra, tmpdir=self.repo)
+        return run_gate(self.payload(tool_name, tool_input), self._env(env_extra), tmpdir=self.repo)
+
+    def gate_full(self, tool_name, tool_input, env_extra=None):
+        return run_gate_full(self.payload(tool_name, tool_input), self._env(env_extra), tmpdir=self.repo)
+
+    def _env(self, env_extra=None):
+        """Point HOME at the scratch repo: the gate reads ~/.medley/{engine-path,bin/medley-engine}
+        for the engine spellings this MACHINE blesses, and the developer's real ones must not decide
+        a test. Cases that exercise that path write into this fake home themselves."""
+        env = {"HOME": self.repo}
+        if env_extra:
+            env.update(env_extra)
+        return env
 
     def dead_pid(self):
         proc = subprocess.Popen(["true"])
@@ -508,6 +520,123 @@ class TestEngineBinaryCarveOut(GateTestCase):
         # Old daemon writing no engine field → today's conservative behavior.
         self.write_state()
         self.assert_bash(f'"{self.engine}" watch', expect_allow=False)
+
+
+class TestEngineRolledMidMission(GateTestCase):
+    """MEASURED FAILURE (the reason this class exists): the watch command is minted ONCE, at
+    mission_start, from the daemon running then — while mission-state.json's `engine` is rewritten
+    by whichever daemon runs NOW. Change the daemon's binary mid-mission (an engine roll on a
+    machine whose exec identity is the versioned path, or a dev override flipping to the downloaded
+    binary) and the realpath match fails on the ONE command the engine told the agent to keep
+    re-running. It was denied as "could mutate the workers' tree"; the agent read that as a gate
+    bug, reported a false positive to the user, and went quiet — taking the dashboard chat's only
+    way back to it with it.
+
+    So the gate also vouches for the spellings the MACHINE blesses: ~/.medley/bin/medley-engine
+    (the TCC-stable hard link the launcher refreshes on every roll) and whatever ~/.medley/engine-path
+    points at. When even that can't match — the old binary was pruned — the denial says STALE, not
+    MUTATING, and hands back the corrected line."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_session_binding("test-session", ["m1"])  # supervising session
+        self.medley = os.path.join(self.repo, ".medley-home", ".medley")  # fake $HOME/.medley
+        os.makedirs(os.path.join(self.medley, "bin"))
+        self.home = os.path.dirname(self.medley)
+        self.rolled_to = os.path.join(self.medley, "bin", "medley-engine-9.9.9")
+        with open(self.rolled_to, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(self.rolled_to, 0o755)
+        self.stale = os.path.join(self.medley, "bin", "medley-engine-0.0.1")  # pruned: never created
+
+    def point_engine_path(self, target):
+        with open(os.path.join(self.medley, "engine-path"), "w") as f:
+            f.write(target + "\n")
+
+    def bash(self, cmd):
+        return self.gate_full("Bash", {"command": cmd}, env_extra={"HOME": self.home})
+
+    def test_command_from_the_previous_daemon_still_runs(self):
+        # state says the NEW binary; the agent re-arms the pointer's target. Blessed → allowed.
+        self.point_engine_path(self.rolled_to)
+        self.write_state(engine={"execPath": os.path.join(self.medley, "bin", "medley-engine")})
+        code, decision, _ = self.bash(
+            f'MEDLEY_DATA_DIR="" CLAUDE_PROJECT_DIR="{self.repo}" "{self.rolled_to}" watch')
+        self.assertEqual((code, decision), (0, None))
+
+    def test_the_stable_link_is_always_vouched_for(self):
+        # The hard link IS the engine — launchd execs the daemon from it, and it survives every roll.
+        link = os.path.join(self.medley, "bin", "medley-engine")
+        with open(link, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(link, 0o755)
+        self.write_state(engine={"execPath": self.rolled_to})
+        code, decision, _ = self.bash(f'"{link}" watch')
+        self.assertEqual((code, decision), (0, None))
+
+    def test_a_dev_bundle_the_pointer_names_is_vouched_for_under_node_only(self):
+        bundle = os.path.join(self.medley, "dist", "medley-engine.cjs")
+        os.makedirs(os.path.dirname(bundle))
+        open(bundle, "w").close()
+        self.point_engine_path(bundle)
+        self.write_state(engine={"execPath": self.rolled_to})
+        code, decision, _ = self.bash(f'"{shutil.which("node") or "node"}" "{bundle}" watch')
+        self.assertEqual((code, decision), (0, None), "node <blessed bundle> watch")
+        # The bundle blesses the BUNDLE, not an arbitrary program pointed at it — `rm <bundle> watch`
+        # would delete the engine.
+        code, decision, _ = self.bash(f'rm "{bundle}" watch')
+        self.assertEqual((code, decision), (0, "deny"))
+
+    def test_pointer_may_name_a_suffixless_symlink_to_a_bundle(self):
+        # A dev pin is often a versioned-looking symlink (so ensure-engine.sh's monotonic guard
+        # protects it) whose target is the bundle. node records the REALPATH in argv[1], which is
+        # what the watch command then carries — so classify on the realpath, not the pointer's name.
+        bundle = os.path.join(self.medley, "dist", "medley-engine.cjs")
+        os.makedirs(os.path.dirname(bundle))
+        open(bundle, "w").close()
+        link = os.path.join(self.medley, "bin", "medley-engine-0.9.1-dev.9")
+        os.symlink(bundle, link)
+        self.point_engine_path(link)
+        self.write_state(engine={"execPath": self.rolled_to})
+        code, decision, _ = self.bash(f'"{shutil.which("node") or "node"}" "{bundle}" watch')
+        self.assertEqual((code, decision), (0, None))
+
+    def test_pruned_binary_denies_as_STALE_with_the_corrected_line(self):
+        self.point_engine_path(self.rolled_to)
+        self.write_state(engine={"execPath": self.rolled_to})
+        code, decision, reason = self.bash(
+            f'MEDLEY_DATA_DIR="/d" CLAUDE_PROJECT_DIR="{self.repo}" "{self.stale}" watch')
+        self.assertEqual((code, decision), (0, "deny"))
+        self.assertIn("STALE WATCHER COMMAND", reason)
+        self.assertNotIn("could mutate", reason)
+        # The corrected line is runnable as-is: same env prefix, same verb, current engine.
+        self.assertIn(f'MEDLEY_DATA_DIR="/d" CLAUDE_PROJECT_DIR="{self.repo}" "{self.rolled_to}" watch',
+                      reason)
+
+    def test_stale_spelling_does_not_excuse_a_mutating_verb(self):
+        self.point_engine_path(self.rolled_to)
+        self.write_state(engine={"execPath": self.rolled_to})
+        for cmd in (f'"{self.stale}" service restart', f'"{self.stale}" mcp'):
+            code, decision, reason = self.bash(cmd)
+            self.assertEqual((code, decision), (0, "deny"), cmd)
+            self.assertNotIn("STALE WATCHER", reason, cmd)
+
+    def test_a_real_mutation_is_never_restated_as_stale(self):
+        self.point_engine_path(self.rolled_to)
+        self.write_state(engine={"execPath": self.rolled_to})
+        for cmd in ("rm -rf src", f'"{self.stale}" watch && rm -rf src', "npm test"):
+            code, decision, reason = self.bash(cmd)
+            self.assertEqual((code, decision), (0, "deny"), cmd)
+            self.assertNotIn("STALE WATCHER", reason, cmd)
+
+    def test_no_pointer_and_no_link_changes_nothing(self):
+        # A machine with neither breadcrumb behaves exactly as before: state's engine or nothing.
+        self.write_state(engine={"execPath": self.rolled_to})
+        code, decision, _ = self.bash(f'"{self.rolled_to}" watch')
+        self.assertEqual((code, decision), (0, None))
+        code, decision, reason = self.bash(f'"{self.stale}" watch')
+        self.assertEqual((code, decision), (0, "deny"))
+        self.assertNotIn("STALE WATCHER", reason)  # nothing to suggest → the plain denial
 
 
 class TestSessionScopedGoldenMatrix(GateTestCase):

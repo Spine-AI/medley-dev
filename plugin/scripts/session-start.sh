@@ -5,6 +5,26 @@
 # Workers inherit the plugin (settingSources) — the mission-agent reminder must never reach a
 # WORKER's context (it would misdirect it to orchestrate), and workers must not (re)install.
 [ "$MEDLEY_WORKER" = "1" ] && exit 0
+# AN AWAY TURN MUST NOT RUN THIS, and missing that is what made a whole class of failures possible.
+#
+# An away turn — the engine resuming the user's own session while their terminal is closed — is a
+# `resume`, so SessionStart fires. This hook then does engine bootstrap, statusline install and
+# launcher installs that a headless turn has no use for: the engine is already running (it is what
+# started the turn), there is no TUI to give a statusline to, and the user's real terminal maintains
+# all of it anyway.
+#
+# It is not merely wasted work, it is HARMFUL. Claude Code reconnects its permission IPC during
+# `SessionStart:resume`, and a hook still running across that reconnect orphans the channel for the
+# rest of the turn (anthropics/claude-code#44435). Measured three times: every tool call came back
+# "The user doesn't want to take this action right now" instantly, the engine's own in-proc MCP server
+# was ABSENT from the SDK's init report, and the turn still ended `success` — so the agent told the
+# user every route was closed and nothing was waiting on them. It struck the FIRST away turn after an
+# engine roll every time, which is exactly when `ensure-engine.sh` has real work to do (version check,
+# engine-path advance, pruning) instead of returning in a few hundred milliseconds.
+#
+# `session-catchup.py` and `mission-watch-gate.py` already stand down on this same flag for their own
+# reasons. This hook was simply missed.
+[ "$MEDLEY_RESUME" = "1" ] && exit 0
 # Read the hook payload (SessionStart / PreCompact deliver JSON on stdin) — consuming stdin also
 # avoids a broken pipe on the delivering side. Two fields matter:
 #   session_id — forwarded to `status --brief` so the reminder can tell THIS session whether it is

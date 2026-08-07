@@ -3,22 +3,38 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"" },
-          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-catchup.py\"" }
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-catchup.py\""
+          }
         ]
       }
     ],
     "PreCompact": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"" }
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"",
+            "timeout": 60
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-catchup.py\"" }
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-catchup.py\""
+          }
         ]
       }
     ],
@@ -26,7 +42,11 @@
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Task|Bash|apply_patch|spawn_agent",
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/edit-conflict-gate.py\"" }
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/edit-conflict-gate.py\"",
+            "timeout": 10
+          }
         ]
       }
     ],
@@ -34,21 +54,33 @@
       {
         "matcher": "mcp__.*__mission_(start|resume|status|wait)",
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-mission-binder.py\"" }
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-mission-binder.py\"",
+            "timeout": 10
+          }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "timeout": 5, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-marker.py\"" }
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-marker.py\""
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "timeout": 10, "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/mission-watch-gate.py\"" }
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/mission-watch-gate.py\""
+          }
         ]
       }
     ]
